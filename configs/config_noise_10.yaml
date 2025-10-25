@@ -1,0 +1,24 @@
+# Noise Level: 10% increased sensor noise
+
+experiment:
+  name: "noise_10"
+  description: "10% increased sensor noise over baseline"
+
+data:
+  sensor_log: "data/sensor_data_clean.csv"
+
+robot:
+  initial_pose: [0.0, 0.0, 0.0]
+
+sensors:
+  lidar:
+    device_name: "LDS-01"
+    noise_std: 0.022           # 10% increase: 0.02 * 1.1 = 0.022
+    max_range: 3.5
+    sparsity: 1
+
+  odometry:
+    alphas: [0.11, 0.11, 0.11, 0.11]  # 10% increase
+
+random_seed: 42
+output_dir: "results"

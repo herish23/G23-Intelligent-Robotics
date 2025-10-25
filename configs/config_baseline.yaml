@@ -1,0 +1,28 @@
+# Baseline Experiment Configuration
+# No extra noise, correct initial pose
+
+experiment:
+  name: "baseline"
+  description: "Baseline experiment with standard sensor noise and correct initial pose"
+
+data:
+  sensor_log: "data/sensor_data_clean.csv"
+
+robot:
+  initial_pose: [0.0, 0.0, 0.0]  # x (m), y (m), theta (rad) - no offset
+
+sensors:
+  lidar:
+    device_name: "LDS-01"
+    noise_std: 0.02            # Baseline: 2cm standard deviation
+    max_range: 3.5             # LDS-01 spec: 0.12-3.5m
+    sparsity: 1                # Use all 360 points (1/1)
+
+  odometry:
+    alphas: [0.1, 0.1, 0.1, 0.1]  # [α1, α2, α3, α4] motion model parameters
+    wheel_base: 0.160           # TurtleBot3 Burger wheel base (m)
+    wheel_radius: 0.033         # TurtleBot3 Burger wheel radius (m)
+
+random_seed: 42               # For reproducible noise
+
+output_dir: "results"         # Where to save estimates and timing

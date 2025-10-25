@@ -1,0 +1,25 @@
+# Initial Pose Uncertainty Test 2
+# Offset: -1.0m X, -1.0m Y, -90° theta
+
+experiment:
+  name: "init_2"
+  description: "Test recovery from incorrect initial pose: -1.0m X, -1.0m Y, -90° rotation"
+
+data:
+  sensor_log: "data/sensor_data_clean.csv"
+
+robot:
+  initial_pose: [-1.0, -1.0, -1.570796]  # x=-1.0m, y=-1.0m, theta=-90°=-1.5708rad
+
+sensors:
+  lidar:
+    device_name: "LDS-01"
+    noise_std: 0.02            # Baseline noise
+    max_range: 3.5
+    sparsity: 1
+
+  odometry:
+    alphas: [0.1, 0.1, 0.1, 0.1]  # Baseline noise
+
+random_seed: 42
+output_dir: "results"
