@@ -1,0 +1,77 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/develop/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/develop/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/develop/projects/objects/floors/protos/RectangleArena.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/develop/projects/objects/factory/containers/protos/WoodenBox.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/robotis/turtlebot/protos/TurtleBot3Burger.proto"
+
+WorldInfo {
+  info [
+    "Simple e-puck simulation that can be controlled with ROS2."
+  ]
+  title "ROS2 simulation of the e-puck robot"
+  basicTimeStep 20
+}
+Viewpoint {
+  orientation -0.5806107707700685 0.5821237297391616 0.5692302663600685 2.1069675267552572
+  position -0.46655538015404896 0.0756982094526387 4.102646826143568
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+}
+RectangleArena {
+  floorSize 1.5 1.5
+  wallHeight 0.2
+}
+WoodenBox {
+  translation -0.265062 0.13 0.05
+  name "wooden box(1)"
+  size 0.1 0.1 0.1
+}
+WoodenBox {
+  translation -0.115895 -0.36 0.05
+  name "wooden box(2)"
+  size 0.1 0.1 0.1
+}
+WoodenBox {
+  translation 0.44 0.12 0.05
+  name "wooden box(3)"
+  size 0.1 0.1 0.1
+}
+WoodenBox {
+  translation 0.29726 -0.29 0.05
+  name "wooden box(4)"
+  size 0.1 0.1 0.1
+}
+WoodenBox {
+  translation -0.158467 0.26 0.05
+  size 0.1 0.1 0.1
+}
+DEF TB3 TurtleBot3Burger {
+  hidden position_0_0 6.174265929527717
+  hidden position_0_1 6.174265929449782
+  hidden position_0_2 47.11752383308137
+  hidden position2_0_2 0.1734048723012739
+  hidden position3_0_2 -3.106740655668536
+  hidden linearVelocity_0 0.1999726621564888 -0.003307712017060319 5.5108331586427266e-09
+  hidden angularVelocity_0 -1.6205025512073197e-07 3.3850584156383154e-07 2.9008552394516276e-07
+  hidden rotation_8 0 1 0 4.6034699295277175
+  hidden linearVelocity_8 0.19997266391635482 -0.0033076918298406534 7.967946804833256e-09
+  hidden angularVelocity_8 0.1002334814077547 6.059777483137338 -3.6825716069575116e-05
+  hidden rotation_9 0.6675665625299968 1.2665389821157387e-07 0.7445501222831595 3.1415973002803494
+  hidden linearVelocity_9 0.1999726499487654 -0.003307717968297896 -1.8322177737871123e-08
+  hidden angularVelocity_9 0.1002334821693135 6.059777482233405 -3.682269905080186e-05
+  hidden rotation_10 -0.017148467394133022 -0.9998515630489571 0.0016679132441137687 3.3150811791136907
+  hidden linearVelocity_10 0.1999726468444951 -0.003307733109247334 2.1799108040484674e-08
+  hidden angularVelocity_10 0.8269332773118218 49.993161711123776 -1.0175929450963462e-14
+  translation 0.22594449633532987 -0.012884736019681884 -0.00015506327914541207
+  rotation -0.0017890439496153342 -0.1722124647954405 -0.9850582045193196 0.016790156171277125
+  controller "tbot_player"
+}
+Robot {
+  name "supervisor"
+  controller "supervisor"
+  supervisor TRUE
+}
