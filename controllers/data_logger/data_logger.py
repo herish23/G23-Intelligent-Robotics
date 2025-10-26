@@ -24,10 +24,9 @@ def yaw_from_axis_angle(ax, ay, az, ang):
     s = math.sin(ang / 2.0)
     c = math.cos(ang / 2.0)
     qx, qy, qz, qw = ax * s, ay * s, az * s, c
-    # quaternion to euler
-    sin_y = 2.0 * (qw * qz + qx * qy)
-    cos_y = 1.0 - 2.0 * (qy * qy + qz * qz)
-    return math.atan2(sin_y, cos_y)
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 
 def load_trajectory(path):
@@ -42,12 +41,11 @@ def load_trajectory(path):
 
 
 def find_robot(sup):
-    # find robot node in scene
+    # find robot node from the webot 
     node = sup.getFromDef(ROBOT_DEF)
     if node:
         return node
 
-    # fallback search by name
     root = sup.getRoot()
     queue = [root]
     while queue:
@@ -105,7 +103,7 @@ def main():
     f = open(out_path, 'w', newline='')
     writer = csv.writer(f)
 
-    # csv header: timestamp, 360 lidar ranges, v, w, ground truth
+    # csv header logging timestamp, 360 lidar ranges, v, w, ground truth
     header = ['timestamp']
     for i in range(360):
         header.append(f'range_{i}')
