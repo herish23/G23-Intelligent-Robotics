@@ -1,15 +1,13 @@
-"""
-Configuration loading from YAML files
-"""
+# load experiment config from yaml
 
 import yaml
 import os
 
 
 def load_config(config_path):
-    """Load experiment configuration from YAML"""
+    # load and validate config file
     if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config not found: {config_path}")
+        raise FileNotFoundError(f"config not found: {config_path}")
 
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -19,24 +17,24 @@ def load_config(config_path):
 
 
 def _validate_config(config):
-    """Check required fields exist"""
+    # check required fields are present
     required = ['experiment', 'data', 'robot', 'sensors']
     for field in required:
         if field not in config:
-            raise ValueError(f"Config missing '{field}' section")
+            raise ValueError(f"missing {field} in config")
 
     if 'lidar' not in config['sensors'] or 'odometry' not in config['sensors']:
-        raise ValueError("Config missing sensor specifications")
+        raise ValueError("sensor config incomplete")
 
     if len(config['robot']['initial_pose']) != 3:
-        raise ValueError("initial_pose must be [x, y, theta]")
+        raise ValueError("initial_pose needs [x, y, theta]")
 
     if len(config['sensors']['odometry']['alphas']) != 4:
-        raise ValueError("odometry alphas must have 4 values")
+        raise ValueError("alphas need 4 values")
 
 
 def get_output_paths(config, algorithm_name):
-    """Generate output file paths for algorithm results"""
+    # generate output file paths
     exp_name = config['experiment']['name']
     output_dir = config.get('output_dir', 'results')
     os.makedirs(output_dir, exist_ok=True)
@@ -48,7 +46,7 @@ def get_output_paths(config, algorithm_name):
 
 
 def print_config_summary(config):
-    """Print configuration summary"""
+    # print experiment setup
     print(f"Experiment: {config['experiment']['name']}")
     if 'description' in config['experiment']:
         print(f"  {config['experiment']['description']}")

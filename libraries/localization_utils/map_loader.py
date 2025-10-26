@@ -1,16 +1,15 @@
-"""
-Map loading utilities for occupancy grid maps
-"""
+# map loading from pgm/yaml files
 
 import numpy as np
 import yaml
 from PIL import Image
 from dataclasses import dataclass
+from .geometry import world_to_grid
 
 
 @dataclass
 class MapInfo:
-    """Container for map data and metadata"""
+    # holds map data + metadata
     occupancy_grid: np.ndarray
     resolution: float
     origin_x: float
@@ -22,8 +21,7 @@ class MapInfo:
 
 
 def load_map(pgm_path, yaml_path):
-    """Load occupancy grid map from PGM and YAML files"""
-    # Load metadata
+    # loads occupancy grid from pgm image and yaml metadata
     with open(yaml_path, 'r') as f:
         metadata = yaml.safe_load(f)
 
@@ -32,19 +30,16 @@ def load_map(pgm_path, yaml_path):
     origin_x, origin_y = origin[0], origin[1]
     occupied_thresh = metadata.get('occupied_thresh', 0.65)
     free_thresh = metadata.get('free_thresh', 0.25)
-    negate = metadata.get('negate', 0)
 
-    # Load image
     img = Image.open(pgm_path)
     img_array = np.array(img)
 
-    # Convert to occupancy probabilities
-    # PGM: 255=white=free, 0=black=occupied
+    # convert to occupancy: 0=free, 1=occupied, 0.5=unknown
     normalized = img_array / 255.0
     occupancy_grid = np.where(
         normalized > (1 - free_thresh),
-        0.0,  # Free
-        np.where(normalized < occupied_thresh, 1.0, 0.5)  # Occupied or Unknown
+        0.0,
+        np.where(normalized < occupied_thresh, 1.0, 0.5)
     )
 
     height, width = occupancy_grid.shape
@@ -62,20 +57,16 @@ def load_map(pgm_path, yaml_path):
 
 
 def is_valid_position(x, y, map_info, safety_margin=0.0):
-    """Check if world position is in free space"""
-    from .geometry import world_to_grid
-
+    # check if position is in free space
     grid_x, grid_y = world_to_grid(x, y, map_info)
 
-    # Check bounds
     if not (0 <= grid_x < map_info.width and 0 <= grid_y < map_info.height):
         return False
 
-    # Check if occupied
     if map_info.occupancy_grid[grid_y, grid_x] > 0.5:
         return False
 
-    # Optional safety margin check
+    # check safety margin if needed
     if safety_margin > 0:
         margin_cells = int(safety_margin / map_info.resolution)
         for dx in range(-margin_cells, margin_cells + 1):
@@ -89,7 +80,7 @@ def is_valid_position(x, y, map_info, safety_margin=0.0):
 
 
 def get_map_bounds(map_info):
-    """Get world coordinates of map boundaries"""
+    # get map boundaries in world coords
     x_min = map_info.origin_x
     y_min = map_info.origin_y
     x_max = x_min + map_info.width * map_info.resolution

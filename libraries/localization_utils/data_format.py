@@ -1,17 +1,11 @@
-"""
-Functions for reading sensor data and writing algorithm outputs
-"""
+# data I/O - load sensor data and save algorithm results
 
 import numpy as np
 import csv
 
 
 def load_sensor_data(csv_path):
-    """
-    Load sensor data from CSV
-
-    Expected format: timestamp, range_0...range_359, v, w, gt_x, gt_y, gt_theta
-    """
+    # load sensor csv (timestamp, 360 lidar ranges, v, w, ground truth)
     timestamps = []
     lidar_scans = []
     odometry = []
@@ -22,14 +16,11 @@ def load_sensor_data(csv_path):
         for row in reader:
             timestamps.append(float(row['timestamp']))
 
-            # LiDAR scan (360 values)
             scan = np.array([float(row[f'range_{i}']) for i in range(360)])
             lidar_scans.append(scan)
 
-            # Odometry
             odometry.append([float(row['v']), float(row['w'])])
 
-            # Ground truth
             ground_truth.append([float(row['gt_x']),
                                 float(row['gt_y']),
                                 float(row['gt_theta'])])
@@ -43,7 +34,7 @@ def load_sensor_data(csv_path):
 
 
 def save_estimates(csv_path, timestamps, estimates):
-    """Save algorithm pose estimates"""
+    # save algorithm outputs to csv
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['timestamp', 'estimated_x', 'estimated_y', 'estimated_theta'])
@@ -54,7 +45,7 @@ def save_estimates(csv_path, timestamps, estimates):
 
 
 def save_timing(csv_path, timestamps, prediction_times, observation_times):
-    """Save computation times"""
+    # save timing info for performance analysis
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['timestamp', 'prediction_time_ms', 'observation_time_ms'])
@@ -64,8 +55,7 @@ def save_timing(csv_path, timestamps, prediction_times, observation_times):
 
 
 def compute_error_metrics(estimates, ground_truth):
-    """Compute error metrics between estimates and ground truth"""
-    # Position errors
+    # calculate mae, rmse etc for comparison
     position_errors = np.sqrt(
         (estimates[:, 0] - ground_truth[:, 0])**2 +
         (estimates[:, 1] - ground_truth[:, 1])**2
