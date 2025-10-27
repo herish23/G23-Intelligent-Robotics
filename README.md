@@ -1,77 +1,82 @@
-# Experiment of Extended Kalman Filter (EKF), Markov Grid Localisation, and Adaptive Monte Carlo Localisation (AMCL with KLD-Sampling)
-
-This is the first commit following the successful submission and approval of our proposal.
+# Comparative Evaluation of EKF, Markov Grid, and Adaptive Monte Carlo (AMCL with KLD-Sampling) Localization for Mobile Robots
 
 ---
 
-## Using the Preset Map and Robot
+## Running the Simulation
 
-To start the simulation:
+To start:
 
-1. Open Webots.
-2. Load the world file located at:
+1. Open Webots
+2. Load the world file: `worlds/exp.wbt`
 
-   ```
-   worlds/exp.wbt
-   ```
-
-This world contains:
-
-* A TurtleBot equipped with a LiDAR sensor.
-* A Supervisor node that records ground-truth data and saves it to CSV logs.
+The world has a TurtleBot3 with LiDAR on a checkboard arena with 5 wooden box obstacles.
 
 ---
 
-## World and Data Files
+## Data Collection
 
-### Logging
+### How it Works
 
-The supervisor automatically logs ground-truth values to:
+The `data_logger` controller runs the robot through a predefined trajectory and collects sensor data for offline processing. It logs:
 
-```
-maps/logs/run_gt.csv
-```
+* LiDAR range readings (360 points)
+* Commanded velocities (v, w)
+* Ground truth position (x, y, theta) from Webots supervisor
 
-### Map Files
-
-The `.pgm` and `.yaml` files required for localisation are stored in:
+All data is saved to:
 
 ```
-maps/
+data/sensor_data_clean.csv
 ```
+## Trajectories
 
-Note: If you make any changes to the map, even small ones, you must generate new `.pgm` and `.yaml` files, since they are derived directly from the 3D world.
+Trajectory files are in `maps/traj/`:
 
-### Trajectories
+* **traj_debug_square.csv** — Simple 0.20m x 0.20m square path (default). Good for initial testing.
+* **traj_eval_complex.csv** — Longer, more complex path for full evaluation.
 
-Sample trajectories are included in:
-
-```
-maps/traj/
-```
-
-The following two example files are provided:
-
-* `traj_debug_square.csv` — default trajectory loaded at startup.
-* `traj_eval_complex.csv` — a more complex evaluation trajectory.
-
-Ground-truth (GT) values in the logs correspond to the `traj_debug_square.csv` path.
+You can change which trajectory is used by editing the `TRAJ_PATH` variable in `controllers/data_logger/data_logger.py` or set the `TRAJ` environment variable.
 
 ---
 
-## Controllers
+## Map Files
 
-Two controllers are included in this project:
+The map files needed for localization are in `maps/`:
 
-1. **Supervisor** — Records motion data and logs ground-truth positions.
-2. **Player** — Controls the TurtleBot equipped with LiDAR, used to implement and test the localisation algorithms (EKF, Markov Grid, AMCL).
+* `epuck_world_map.pgm` — occupancy grid map
+* `epuck_world_map.yaml` — map metadata (resolution, origin, etc)
+
+These were generated from the Webots world and match the 5 box obstacles in the simulation.
+
+**Note:** If you change the world layout, you'll need to regenerate these files.
+
+---
+
+## Configuration Files
+
+Multiple config files are provided in `configs/` to test different conditions:
+
+* `config_baseline.yaml` — no extra noise
+* `config_noise_XX.yaml` — adds 10%-80% noise to sensors
+* `config_init_X.yaml` — tests recovery from wrong initial pose
+* `config_sparse_4.yaml` — uses only 1/4 of LiDAR points
+
+These let you test how robust each algorithm is under different conditions.
 
 ---
 
-## Notes
+## Offline Processing
 
-* Any modification to the world or map will require regenerating the corresponding map files (`.pgm` and `.yaml`).
-* The default configuration is set up for initial experimentation and algorithm testing.
+After collecting data, you'll run the three localization algorithms (EKF, Markov Grid, AMCL) on the saved CSV data. Each algorithm will:
+
+1. Load the sensor data
+2. Process odometry + LiDAR readings
+3. Estimate robot position at each timestep
+4. Compare against ground truth to calculate error metrics
+
+This setup lets us do fair comparisons since all algorithms process the exact same data.
 
 ---
+
+
 
