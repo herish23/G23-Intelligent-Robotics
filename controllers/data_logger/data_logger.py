@@ -9,7 +9,7 @@ import os
 # config
 ROBOT_DEF = os.environ.get("ROBOT_DEF", "TB3")
 ROBOT_NAME = os.environ.get("ROBOT_NAME", "TurtleBot3Burger")
-TRAJ_PATH = os.environ.get("TRAJ", "../../maps/traj/traj_eval_complex.csv")
+TRAJ_PATH = os.environ.get("TRAJ", "../../maps/traj/traj_debug_square.csv")
 OUT_DIR = os.environ.get("OUT_DIR", "../../data")
 OUT_FILE = os.environ.get("OUT_FILE", "sensor_data_clean.csv")
 DT_LOG = float(os.environ.get("DT_LOG", "0.02"))
@@ -114,7 +114,14 @@ def main():
     next_log_time = 0.0
     trajectory_done = False
 
+    # Track expected position based on commanded velocities
+    expected_x, expected_y, expected_theta = trans_field.getSFVec3f()[0], trans_field.getSFVec3f()[1], 0.0
+    last_print_time = 0.0
+    print_interval = 1.0  # Print every 1 second
+
     print("starting data collection...")
+    print(f"Initial position: ({expected_x:.3f}, {expected_y:.3f})")
+    print(f"{'Time':>6s} | {'Cmd_v':>6s} {'Cmd_w':>6s} | {'Actual_X':>8s} {'Actual_Y':>8s} {'Actual_θ':>7s} | {'Exp_X':>8s} {'Exp_Y':>8s} {'Exp_θ':>7s} | {'ΔPos':>6s}")
 
     while sup.step(timestep) != -1:
         sim_time = sup.getTime()
@@ -151,6 +158,28 @@ def main():
         ax, ay, az, ang = rot_field.getSFRotation()
         gt_theta = yaw_from_axis_angle(ax, ay, az, ang)
 
+        # Update expected position based on commanded velocities (simple integration)
+        dt = timestep / 1000.0
+        if abs(cmd_w) < 1e-6:  # Straight line
+            expected_x += cmd_v * math.cos(expected_theta) * dt
+            expected_y += cmd_v * math.sin(expected_theta) * dt
+        else:  # Arc motion
+            dtheta = cmd_w * dt
+            radius = cmd_v / cmd_w
+            expected_x += radius * (math.sin(expected_theta + dtheta) - math.sin(expected_theta))
+            expected_y += radius * (-math.cos(expected_theta + dtheta) + math.cos(expected_theta))
+            expected_theta += dtheta
+        expected_theta = math.atan2(math.sin(expected_theta), math.cos(expected_theta))
+
+        # Print comparison every second
+        if sim_time - last_print_time >= print_interval:
+            pos_error = math.sqrt((x - expected_x)**2 + (y - expected_y)**2)
+            theta_error_deg = math.degrees(abs(gt_theta - expected_theta))
+            if theta_error_deg > 180:
+                theta_error_deg = 360 - theta_error_deg
+            print(f"{sim_time:6.2f} | {cmd_v:6.2f} {cmd_w:6.2f} | {x:8.3f} {y:8.3f} {math.degrees(gt_theta):7.1f} | {expected_x:8.3f} {expected_y:8.3f} {math.degrees(expected_theta):7.1f} | {pos_error*100:6.1f}cm")
+            last_print_time = sim_time
+
         # write csv row
         row = [f"{sim_time:.3f}"]
         for r in ranges:
@@ -172,7 +201,25 @@ def main():
     left_motor.setVelocity(0.0)
     right_motor.setVelocity(0.0)
 
-    print("data collection complete!")
+    # Final position comparison
+    x, y, z = trans_field.getSFVec3f()
+    ax, ay, az, ang = rot_field.getSFRotation()
+    gt_theta = yaw_from_axis_angle(ax, ay, az, ang)
+    final_pos_error = math.sqrt((x - expected_x)**2 + (y - expected_y)**2)
+    final_theta_error = math.degrees(abs(gt_theta - expected_theta))
+    if final_theta_error > 180:
+        final_theta_error = 360 - final_theta_error
+
+    print("\n" + "="*70)
+    print("TRAJECTORY TRACKING SUMMARY")
+    print("="*70)
+    print(f"Final Actual Position:   ({x:.3f}, {y:.3f}, {math.degrees(gt_theta):.1f}°)")
+    print(f"Final Expected Position: ({expected_x:.3f}, {expected_y:.3f}, {math.degrees(expected_theta):.1f}°)")
+    print(f"Position Error:  {final_pos_error*100:.1f} cm")
+    print(f"Heading Error:   {final_theta_error:.1f}°")
+    print("="*70)
+
+    print("\ndata collection complete!")
     print(f"saved to: {os.path.abspath(out_path)}")
 
 
