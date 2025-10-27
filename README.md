@@ -1,4 +1,4 @@
-# Experiment of Extended Kalman Filter (EKF), Markov Grid Localisation, and Adaptive Monte Carlo Localisation (AMCL with KLD-Sampling)
+# Comparative Evaluation of EKF, Markov Grid, and Adaptive Monte Carlo (AMCL with KLD-Sampling) Localization for Mobile Robots
 
 This is the first commit following the successful submission and approval of our proposal.
 
