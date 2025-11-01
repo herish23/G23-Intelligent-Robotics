@@ -337,3 +337,38 @@ p_conv_kld = kld_resample(p_conv, map_info)
 print(f"converged {len(p_conv)} , {len(p_conv_kld)}")
 
 
+## test the integrations on the sensor_data
+def run_amcl(sensor_data, map_info, n_particles=500, use_kld=True):
+    particles = initialize_particles(n_particles, map_info)
+    n_steps = len(sensor_data['timestamps'])
+    estimates = []
+    print(f"\n{n_steps} timesteps")
+
+    for t in range(1, n_steps):
+        # odom from gt
+        prev_odom = sensor_data['ground_truth'][t-1]
+        curr_odom = sensor_data['ground_truth'][t]
+
+        motion_update(particles, prev_odom, curr_odom)
+
+        # sensor update
+        lidar = sensor_data['lidar_scans'][t]
+        sensor_update(particles, lidar, likelihood_field, map_info)
+        normalize_weights(particles)
+
+        # resample
+        if use_kld:
+            particles = kld_resample(particles, map_info)
+        else:
+            particles = resample(particles)
+        est_x, est_y, est_theta = get_mean_pose(particles)
+        estimates.append((est_x, est_y, est_theta))
+        if t % 50 == 0:
+            gt = sensor_data['ground_truth'][t]
+            err = np.sqrt((est_x - gt[0])**2 + (est_y - gt[1])**2)
+            print(f"t={t}: est=({est_x:.2f},{est_y:.2f}), gt=({gt[0]:.2f},{gt[1]:.2f}), err={err:.3f}m, n={len(particles)}")
+
+    return estimates
+
+estimates = run_amcl(sensor_data, map_info, n_particles=100, use_kld=True)
+
