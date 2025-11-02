@@ -1,1 +1,260 @@
-rohit commiting 
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import shift
+
+# --- CONFIGURATION ---
+GRID_SIZE = 40
+WALL = 1.0
+FREE = 0.0
+TRUE_START_POS = (5, 5)
+
+# --- PROBABILITY MODEL PARAMETERS ---
+P_HIT = 0.9
+P_MISS = 0.01
+P_MAX_RANGE = 0.05
+MAX_RANGE = 20.0
+
+def create_map():
+    """Creates a simple 2D map with obstacles (1.0) and free space (0.0)."""
+    grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=float)
+
+    # Outer Walls
+    grid[0, :] = WALL
+    grid[-1, :] = WALL
+    grid[:, 0] = WALL
+    grid[:, -1] = WALL
+
+    # Inner walls/structures
+    grid[10:30, 15] = WALL
+    grid[10:20, 25] = WALL
+    grid[30, 20:35] = WALL
+    grid[15, 20:30] = WALL
+    grid[1:10, 30] = WALL
+
+    return grid
+
+def initialize_belief(grid):
+    """Initializes the probability distribution (belief) uniformly over free space."""
+    belief = np.where(grid == FREE, 1.0, 0.0)
+    total_free_cells = np.sum(belief)
+    if total_free_cells > 0:
+        belief /= total_free_cells
+    else:
+        belief.fill(1.0 / (GRID_SIZE * GRID_SIZE))
+    return belief
+
+# --- 2D GEOMETRY / SIMULATED LIDAR ---
+
+def ray_cast_distance(grid, x, y, dx, dy):
+    """
+    Simulates a ray cast from (x, y) in direction (dx, dy) to find the nearest wall.
+    """
+    fx, fy = float(x), float(y)
+    dist = 0.0
+    max_steps = int(MAX_RANGE) * 2
+
+    for _ in range(max_steps):
+        fx += dx
+        fy += dy
+        ix, iy = int(round(fx)), int(round(fy))
+
+        if not (0 <= ix < GRID_SIZE and 0 <= iy < GRID_SIZE):
+            return MAX_RANGE # Hit map boundary
+        if grid[iy, ix] == WALL:
+            return np.sqrt((ix - x)**2 + (iy - y)**2) # Hit wall
+
+        dist += np.sqrt(dx**2 + dy**2)
+        if dist > MAX_RANGE:
+            return MAX_RANGE
+    return MAX_RANGE # No wall found
+
+def get_expected_measurement(grid, pos, angle_deg):
+    """Calculates the expected range measurement from a position at a specific angle."""
+    x, y = pos
+    angle_rad = np.deg2rad(angle_deg)
+    dx = np.cos(angle_rad) * 0.5
+    dy = np.sin(angle_rad) * 0.5
+    return ray_cast_distance(grid, x, y, dx, dy)
+
+def simulate_noisy_lidar(grid, pos, angle_deg):
+    """Simulates a noisy LiDAR measurement at the true position."""
+    true_dist = get_expected_measurement(grid, pos, angle_deg)
+    noise = np.random.normal(0, 0.5)
+    measured_dist = true_dist + noise
+
+    if measured_dist > MAX_RANGE or np.random.rand() < 0.05:
+        return MAX_RANGE
+    return max(0.1, measured_dist)
+
+# --- LOCALIZATION ALGORITHM ---
+
+def update_prediction(belief, motion_delta, grid):
+    """
+    Updates the belief state based on the robot's motion (Prediction Step).
+    """
+    dx, dy = motion_delta
+    new_belief = shift(belief, (-dy, -dx), mode='wrap', cval=0)
+
+    # Simple blur for noise
+    blurred_belief = np.copy(new_belief)
+    for i in range(1, GRID_SIZE - 1):
+        for j in range(1, GRID_SIZE - 1):
+            sum_prob = new_belief[i, j] * 0.4
+            sum_prob += np.sum(new_belief[i-1:i+2, j-1:j+2]) * 0.0667
+            blurred_belief[i, j] = sum_prob
+
+    blurred_belief[grid == WALL] = 0.0
+
+    # Re-normalize
+    sum_belief = np.sum(blurred_belief)
+    if sum_belief <= 1e-12:
+        print("Warning: Belief collapsed during prediction. Re-initializing.")
+        return initialize_belief(grid)
+    return blurred_belief / np.sum(blurred_belief)
+
+
+def update_correction(belief, grid, measurement, angle_deg):
+    """
+    Updates the belief state based on a new measurement (Correction Step).
+    """
+    new_belief = np.zeros_like(belief)
+    for y in range(GRID_SIZE):
+        for x in range(GRID_SIZE):
+            if grid[y, x] == FREE:
+                expected_dist = get_expected_measurement(grid, (x, y), angle_deg)
+
+                likelihood = 0.0
+                if measurement >= MAX_RANGE * 0.95:
+                    if expected_dist >= MAX_RANGE * 0.95:
+                        likelihood = P_HIT
+                    else:
+                        likelihood = P_MAX_RANGE
+                else:
+                    error = abs(measurement - expected_dist)
+                    if error < 1.0:
+                        likelihood = P_HIT * np.exp(-0.5 * error**2)
+                    elif error > 10.0:
+                        likelihood = P_MISS
+                    else:
+                        likelihood = P_MISS + (P_HIT - P_MISS) * np.exp(-0.05 * error)
+                
+                new_belief[y, x] = likelihood * belief[y, x]
+
+    # Normalize
+    sum_belief = np.sum(new_belief)
+    if sum_belief > 0:
+        return new_belief / sum_belief
+    else:
+        print("Warning: Belief collapsed during correction. Re-initializing.")
+        return initialize_belief(grid)
+
+
+# --- VISUALIZATION (MODIFIED) ---
+
+def plot_state(fig, grid, belief, true_pos, title):
+    """
+    Plots the state onto the *existing* figure object 'fig'.
+    """
+    # *** CHANGE 1: Clear the figure instead of creating a new one ***
+    fig.clf() 
+
+    # *** CHANGE 2: Add subplots to the existing figure ***
+    # Subplot 1: Map and True Position
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax1.imshow(grid, cmap='binary', origin='lower')
+    ax1.plot(true_pos[0], true_pos[1], 'ro', markersize=10, label='True Position')
+    ax1.set_title("Environment Map & True Position")
+    ax1.set_xticks([]), ax1.set_yticks([])
+    ax1.legend()
+
+    # Subplot 2: Belief Distribution
+    ax2 = fig.add_subplot(1, 2, 2)
+    masked_belief = np.ma.masked_where(belief <= 1e-10, belief)
+    vmax = np.max(belief) if np.max(belief) > 0 else 1.0
+    
+    ax2.imshow(grid, cmap='binary', origin='lower') # Show map underneath
+    im = ax2.imshow(masked_belief, cmap='viridis', origin='lower', vmin=0, vmax=vmax, alpha=0.8)
+    
+    ax2.plot(true_pos[0], true_pos[1], 'wx', markersize=10, markeredgewidth=2, label='True Pos')
+    ax2.set_title(title)
+    ax2.set_xticks([]), ax2.set_yticks([])
+    
+    # Redraw the colorbar each time
+    fig.colorbar(im, ax=ax2, label='Probability')
+
+    plt.tight_layout()
+    plt.pause(0.5) # Pause to allow plot to update
+
+# --- MAIN SIMULATION LOOP (MODIFIED) ---
+
+def main():
+    """Runs the grid-based localization simulation."""
+    print("--- Starting Grid-Based Localization Simulation ---")
+    
+    # Enable interactive mode
+    plt.ion()
+    
+    # *** CHANGE 3: Create the figure ONCE, before the loop ***
+    fig = plt.figure(figsize=(10, 5))
+    
+    # 1. Setup Environment and Initial Belief
+    grid = create_map()
+    belief = initialize_belief(grid)
+    true_pos = list(TRUE_START_POS)
+
+    # *** CHANGE 4: Pass 'fig' to the plot function ***
+    plot_state(fig, grid, belief, true_pos, "Initial Uniform Belief")
+
+    # 2. Define Simulation Steps
+    simulation_steps = [
+        ((1, 0), [0, 90, 180, 270]), # Move right
+        ((1, 0), [0, 90, 180, 270]), # Move right
+        ((0, 1), [0, 90, 180, 270]), # Move up
+        ((0, 1), [0, 90, 180, 270]), # Move up
+        ((1, 0), [0, 90, 180, 270]), # Move right
+        ((1, 0), [0, 90, 180, 270]), # Move right
+        ((1, 0), [0, 90, 180, 270]), # Move right
+        ((0, -1), [0, 90, 180, 270]),# Move down
+        ((0, -1), [0, 90, 180, 270]),# Move down
+        ((-1, 0), [0, 90, 180, 270]),# Move left
+    ]
+
+    for step_count, (motion, angles) in enumerate(simulation_steps):
+        print(f"\n--- Step {step_count + 1}: Motion {motion} ---")
+
+        # --- A. Prediction (Motion Update) ---
+        
+        # Update True Position
+        true_pos[0] = (true_pos[0] + motion[0])
+        true_pos[1] = (true_pos[1] + motion[1])
+        
+        # Collision check
+        if not (0 <= true_pos[0] < GRID_SIZE and 0 <= true_pos[1] < GRID_SIZE) or \
+           grid[true_pos[1], true_pos[0]] == WALL:
+            print(f"Collision detected! Moving robot back.")
+            true_pos[0] = (true_pos[0] - motion[0])
+            true_pos[1] = (true_pos[1] - motion[1])
+        
+        belief = update_prediction(belief, motion, grid)
+        
+        # *** CHANGE 5: Pass 'fig' to the plot function ***
+        plot_state(fig, grid, belief, true_pos, f"Step {step_count + 1} - After Prediction (Motion)")
+        
+        # --- B. Correction (Measurement Update) ---
+        for angle in angles:
+            measured_dist = simulate_noisy_lidar(grid, true_pos, angle)
+            print(f"  > Angle {angle}°: Measured {measured_dist:.2f} (True: {get_expected_measurement(grid, true_pos, angle):.2f})")
+            belief = update_correction(belief, grid, measured_dist, angle)
+            
+        # *** CHANGE 6: Pass 'fig' to the plot function ***
+        plot_state(fig, grid, belief, true_pos, f"Step {step_count + 1} - After All Corrections")
+
+        est_y, est_x = np.unravel_index(np.argmax(belief), belief.shape)
+        print(f"  > Best Estimate: ({est_x}, {est_y}) (True: {true_pos[0]}, {true_pos[1]})")
+
+    print("\n--- Simulation Complete ---")
+    plt.ioff() # Turn off interactive mode
+    plt.show() # Keep the final plot open
+    
+if __name__ == "__main__":
+    main()
