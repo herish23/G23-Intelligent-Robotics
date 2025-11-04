@@ -1,13 +1,3 @@
-"""
-run_grid_localization.py
-
-Main script to run Grid-Based (Markov) Localization using the 
-localization_utils package.
-
-** This version has been edited to remove 'config.yaml' **
-** All paths and settings are now hardcoded in the CONFIG dictionary below. **
-"""
-
 import numpy as np
 import time
 import csv
@@ -30,8 +20,9 @@ CONFIG = {
         
         # --- 2. UPDATE THESE PATHS ---
         # Must be the FULL, ABSOLUTE paths to your map files
-        'map_pgm_path': r'C:\Users\Rohit\Desktop\Intelligent Robotics\G23-Intelligent-Robotics\maps\map.pgm',  # <-- UPDATE THIS
-        'map_yaml_path': r'C:\Users\Rohit\Desktop\Intelligent Robotics\G23-Intelligent-Robotics\maps\map.yaml', # <-- UPDATE THIS
+        # --- I'VE UPDATED THESE FILENAMES TO MATCH YOUR MAP FILES ---
+        'map_pgm_path': r'C:\Users\Rohit\Desktop\Intelligent Robotics\G23-Intelligent-Robotics\maps\epuck_world_map.pgm',
+        'map_yaml_path': r'C:\Users\Rohit\Desktop\Intelligent Robotics\G23-Intelligent-Robotics\maps\epuck_world_map.yaml',
     },
     'sensors': {
         'lidar': {
@@ -56,18 +47,18 @@ sys.path.append(r'C:\Users\Rohit\Desktop\Intelligent Robotics\G23-Intelligent-Ro
 
 # Import all the utilities from your new package
 try:
-    from localization_utils import (
-        # Removed config loading functions
-        MapInfo,
-        load_map,
-        load_sensor_data,
-        compute_likelihood_field,
-        compute_scan_likelihood_field,
-        grid_to_world,
-        world_to_grid
+    # --- UPDATED IMPORTS ---
+    # We now import directly from the .py files inside the package
+    # (as shown in your screenshot). This is more robust.
+    from localization_utils.map_loader import MapInfo, load_map
+    from localization_utils.data_format import load_sensor_data
+    from localization_utils.likelihood_field import (
+        compute_likelihood_field, 
     )
-except ImportError:
-    print("Error: Could not import the 'localization_utils' package.")
+    from localization_utils.geometry import grid_to_world, world_to_grid
+
+except ImportError as e:
+    print(f"Error: Could not import from the 'localization_utils' package: {e}")
     print(f"Tried to find it in: {sys.path[-1]}")
     print("Please ensure this path is correct and contains the 'localization_utils' folder.")
     exit(1)
