@@ -14,17 +14,17 @@ print("Data loaded")
 print(f"timesteps: {len(sensor_data['timestamps'])}")
 
 
-## Baseline test 
+## Baseline test
 ## Params: alpha=0.2, sigma=0.2, beams=60, n_min=100, eps=0.05
 
-def test_baseline():
-    # current values in the amcl code
+def test_baseline(run_num):
+    # fresh particles each run
     particles = initialize_particles(100, map_info)
     n_steps = len(sensor_data['timestamps'])
 
     results = []
 
-    print("\nRunning baseline test...")
+    print(f"\n=== RUN {run_num}/3 ===")
     for t in range(1, n_steps):
         prev_odom = sensor_data['ground_truth'][t-1]
         curr_odom = sensor_data['ground_truth'][t]
@@ -62,8 +62,8 @@ def test_baseline():
         if t % 50 == 0:
             print(f"t={t}: err={err:.3f}m, n={len(particles)}")
 
-    # save to csv
-    with open('results/baseline.csv', 'w', newline='') as f:
+    # save this run to csv
+    with open(f'results/baseline_run{run_num}.csv', 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['t', 'x_est', 'y_est', 'theta_est','x_gt', 'y_gt', 'theta_gt','error', 'n_particles'])
         writer.writeheader()
         writer.writerows(results)
@@ -78,14 +78,28 @@ def test_baseline():
     particles_count = [r['n_particles'] for r in results]
     mean_particles = np.mean(particles_count)
 
-    print(f"Mean error: {mean_err:.3f}m")
-    print(f"Std error: {std_err:.3f}m")
-    print(f"Min error: {min_err:.3f}m")
-    print(f"Max error: {max_err:.3f}m")
-    print(f"Avg particles: {mean_particles:.1f}")
+    print(f"Run {run_num} - Mean error: {mean_err:.3f}m, Std: {std_err:.3f}m")
 
-    return mean_err, std_err
+    return mean_err, std_err, min_err, max_err, mean_particles
 
 
-# run baseline
-test_baseline()
+## run the test 3 times 
+all_runs = []
+for run in range(1, 4):
+    mean_err, std_err, min_err, max_err, avg_p = test_baseline(run)
+    all_runs.append({
+        'run': run,
+        'mean': mean_err,
+        'std': std_err,
+        'min': min_err,
+        'max': max_err,
+        'particles': avg_p
+    })
+
+# summary
+print("\n=== BASELINE RESULTS ===")
+for r in all_runs:
+    print(f"Run {r['run']}: {r['mean']:.3f}m")
+
+avg = np.mean([r['mean'] for r in all_runs])
+print(f"\nAverage: {avg:.3f}m")
