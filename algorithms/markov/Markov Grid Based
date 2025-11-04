@@ -3,6 +3,9 @@ run_grid_localization.py
 
 Main script to run Grid-Based (Markov) Localization using the 
 localization_utils package.
+
+** This version has been edited to remove 'config.yaml' **
+** All paths and settings are now hardcoded in the CONFIG dictionary below. **
 """
 
 import numpy as np
@@ -11,19 +14,50 @@ import csv
 import math
 import sys
 import random 
+import os # Added os for path joining
+
+# -----------------------------------------------------------------------------
+# CONFIGURATION
+# -----------------------------------------------------------------------------
+# All settings are in this dictionary. Update the paths to match your system.
+# *** IMPORTANT: Update all 3 paths below to be FULL, ABSOLUTE paths ***
+# -----------------------------------------------------------------------------
+CONFIG = {
+    'data': {
+        # --- 1. UPDATE THIS PATH ---
+        # Must be the FULL, ABSOLUTE path to your sensor data
+        'sensor_data_csv_path': r'C:\Users\Rohit\Desktop\Intelligent Robotics\G23-Intelligent-Robotics\data\sensor_data_clean.csv',
+        
+        # --- 2. UPDATE THESE PATHS ---
+        # Must be the FULL, ABSOLUTE paths to your map files
+        'map_pgm_path': r'C:\Users\Rohit\Desktop\Intelligent Robotics\G23-Intelligent-Robotics\maps\map.pgm',  # <-- UPDATE THIS
+        'map_yaml_path': r'C:\Users\Rohit\Desktop\Intelligent Robotics\G23-Intelligent-Robotics\maps\map.yaml', # <-- UPDATE THIS
+    },
+    'sensors': {
+        'lidar': {
+            'num_rays': 360,     # Total rays in the scan
+            'fov_deg': 360,      # Field of view in degrees
+            'sparsity': 10,      # Use 1-in-every-X rays (e.g., 10)
+        }
+    },
+    'localization': {
+        'likelihood_sigma': 0.5,     # Std. dev. for likelihood field (meters)
+        'likelihood_max_dist': 2.0,  # Max distance for likelihood (meters)
+        'motion_diffusion_factor': 0.1, # How much to "blur" on prediction
+    }
+}
+# -----------------------------------------------------------------------------
 
 
 # Add the path to the libraries folder
-sys.path.append("../../libraries")
-# ^^^ This was removed. A simpler way is to put the 'localization_utils' 
-# folder in the SAME directory as this 'run_grid_localization.py' script.
+# Using the absolute path you provided to find 'localization_utils'
+sys.path.append(r'C:\Users\Rohit\Desktop\Intelligent Robotics\G23-Intelligent-Robotics\libraries')
+
 
 # Import all the utilities from your new package
 try:
     from localization_utils import (
-        load_config,
-        print_config_summary,
-        get_output_paths,
+        # Removed config loading functions
         MapInfo,
         load_map,
         load_sensor_data,
@@ -34,7 +68,8 @@ try:
     )
 except ImportError:
     print("Error: Could not import the 'localization_utils' package.")
-    print("Please ensure the 'localization_utils' folder is in the SAME directory as this script.")
+    print(f"Tried to find it in: {sys.path[-1]}")
+    print("Please ensure this path is correct and contains the 'localization_utils' folder.")
     exit(1)
 
 
@@ -131,7 +166,9 @@ def correction_step(belief_grid, sensor_data, map_info, likelihood_field, config
 
     # Convert from log-probability to probability
     # Subtract max for numerical stability
-    likelihood_grid = np.exp(log_likelihood_grid - np.max(log_likelihood_grid))
+    # Find the max finite log-likelihood
+    max_log_like = np.max(log_likelihood_grid[np.isfinite(log_likelihood_grid)])
+    likelihood_grid = np.exp(log_likelihood_grid - max_log_like)
     
     # Update belief: Bel(x_t) = eta * P(z_t | x_t) * Bel_bar(x_t)
     updated_belief = belief_grid * likelihood_grid
@@ -146,10 +183,10 @@ def correction_step(belief_grid, sensor_data, map_info, likelihood_field, config
         return np.ones_like(belief_grid) / belief_grid.size
 
 def main():
-    config_path = 'config.yaml'
-    print(f"Loading configuration from {config_path}...")
-    config = load_config(config_path)
-    print_config_summary(config)
+    # Removed config loading
+    print(f"Loading configuration from internal CONFIG dictionary...")
+    # Use the global CONFIG object
+    config = CONFIG 
     
     # --- 1. Load Map ---
     print("\nLoading map...")
@@ -161,8 +198,7 @@ def main():
         print(f"Map loaded: {map_info.width}x{map_info.height} cells @ {map_info.resolution:.3f} m/cell")
     except FileNotFoundError as e:
         print(f"Error loading map: {e}")
-        print("Please ensure 'map_pgm_path' and 'map_yaml_path' in config.yaml are correct.")
-        print("You must provide the .pgm file yourself.")
+        print("Please ensure 'map_pgm_path' and 'map_yaml_path' in the global CONFIG dictionary are correct.")
         return
 
     # --- 2. Pre-compute Likelihood Field ---
@@ -185,8 +221,8 @@ def main():
     
     # --- 4. Load Sensor Data ---
     print("Loading sensor data...")
-    # We use the 'load_sensor_data' function we created in data_format.py
-    # This assumes the CSV has 'gt_x', 'gt_y', 'gt_theta', and 'range_...' columns
+    # We use the 'load_sensor_data' function
+    # It will now get the path from the global CONFIG dict
     sensor_log = load_sensor_data(config)
     if not sensor_log:
         print("Failed to load sensor data. Exiting.")
@@ -240,6 +276,8 @@ def main():
         prob_at_gt = 0.0
         if 0 <= gt_grid_x < map_info.width and 0 <= gt_grid_y < map_info.height:
              prob_at_gt = belief_grid[gt_grid_y, gt_grid_x]
+        else:
+            print("  Warning: Ground truth is outside map bounds.")
 
         # --- 6. Print and Compare ---
         print("\n  --- Results ---")
@@ -248,11 +286,14 @@ def main():
         print(f"  Ground Truth (Grid):  ({gt_grid_x}, {gt_grid_y})")
         print(f"  Estimated Pos (World): ({est_x_m:.2f}m, {est_y_m:.2f}m)")
         print(f"  Estimated Pos (Grid):  ({est_grid_x}, {est_grid_y})")
+        print(f"  Position Error: {math.dist((gt_x_m, gt_y_m), (est_x_m, est_y_m)):.3f} m")
         print(f"  Highest Belief: {max_prob:.4e}")
         print(f"  Belief at GT:   {prob_at_gt:.4e}")
 
         # Update last pose for next iteration
         last_gt_pose = current_gt_pose
+    
+    print("\n--- Localization Complete ---")
 
 if __name__ == "__main__":
     main()
