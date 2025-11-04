@@ -8,7 +8,9 @@ from localization_utils import load_sensor_data, load_map, compute_likelihood_fi
 
 ## load sensor data and map
 sensor_data = load_sensor_data('../../data/sensor_data_clean.csv')
+
 map_info = load_map('../../maps/epuck_world_map.pgm', '../../maps/epuck_world_map.yaml')
+
 print(f"Loaded {len(sensor_data)} timesteps")
 print(f"Map size: {map_info.width} x {map_info.height}")
 
@@ -141,7 +143,8 @@ def sensor_update(particles, lidar_ranges, likelihood_field, map_info):
     beam_step = 360 // num_beams
 
     for p in particles:
-        w = 1.0
+        log_w = 0.0  # use log to avoid underflow
+        n_beams = 0  # count valid beams
 
         ## loop through subset of beams
         for i in range(0, 360, beam_step):
@@ -162,20 +165,22 @@ def sensor_update(particles, lidar_ranges, likelihood_field, map_info):
 
             # inside map?
             if 0 <= mx < map_info.width and 0 <= my < map_info.height:
-                ## lookup distance to nearest obsacle
-                d = likelihood_field[my, mx]
-
-                # gaussian prob - small distance = high weight
-                prob_hit = np.exp(-(d**2) / (2 * sigma_hit**2))
+                ## lookup likelihood from precomputed field
+                prob_hit = likelihood_field[my, mx]
 
                 # mix of gaussian + uniform random
                 prob_z = z_hit * prob_hit + z_rand / max_range
-                w *= prob_z
+                log_w += np.log(prob_z)  # sum logs instead of multiply
+                n_beams += 1
             else:
                 # outside map, penalize heavily
-                w *= 0.01  # check: is this too harsh?
+                log_w += np.log(0.01)
+                n_beams += 1
 
-        p.weight = w
+        # average log likelihood instead of sum to avoid underflow
+        if n_beams > 0:
+            log_w = log_w / n_beams
+        p.weight = np.exp(log_w)  # convert back from log space
 
 
 ## low variance sampling to reduce sampling error
@@ -215,32 +220,30 @@ def resample(particles):
     return new_p
 
 
-particles = initialize_particles(100, map_info)
-print("particles", len(particles))
-print("first particle ", particles[0].x, particles[0].y)
-# motion test
-gt0 = sensor_data['ground_truth'][0]
-gt1 = sensor_data['ground_truth'][1]
-prev_odom = (gt0[0], gt0[1], gt0[2])
-curr_odom = (gt1[0], gt1[1], gt1[2])
-motion_update(particles, prev_odom, curr_odom)
-print("after motion", particles[0].x, particles[0].y)
-# sensor update
-lidar_data = sensor_data['lidar_scans'][1]
-sensor_update(particles, lidar_data, likelihood_field, map_info)
-print("weights:", particles[0].weight, particles[1].weight)
-normalize_weights(particles)
+if __name__ == "__main__":
+    particles = initialize_particles(100, map_info)
+    print("particles", len(particles))
+    print("first particle ", particles[0].x, particles[0].y)
+    # motion test
+    gt0 = sensor_data['ground_truth'][0]
+    gt1 = sensor_data['ground_truth'][1]
+    prev_odom = (gt0[0], gt0[1], gt0[2])
+    curr_odom = (gt1[0], gt1[1], gt1[2])
+    motion_update(particles, prev_odom, curr_odom)
+    print("after motion", particles[0].x, particles[0].y)
+    # sensor update
+    lidar_data = sensor_data['lidar_scans'][1]
+    sensor_update(particles, lidar_data, likelihood_field, map_info)
+    normalize_weights(particles)
 
-# try resample
-particles = resample(particles)
-print("resampled:", len(particles))
-mx, my, mtheta = get_mean_pose(particles)
-print(f"est {mx:.3f}, {my:.3f}, {mtheta:.3f}")
-print(f"gt  {gt1[0]:.3f}, {gt1[1]:.3f}, {gt1[2]:.3f}")
-err = np.sqrt((mx-gt1[0])**2 + (my-gt1[1])**2)
-print(f"error: {err:.3f}m")
-
-
+    # try resample
+    particles = resample(particles)
+    print("resampled:", len(particles))
+    mx, my, mtheta = get_mean_pose(particles)
+    print(f"est {mx:.3f}, {my:.3f}, {mtheta:.3f}")
+    print(f"gt  {gt1[0]:.3f}, {gt1[1]:.3f}, {gt1[2]:.3f}")
+    err = np.sqrt((mx-gt1[0])**2 + (my-gt1[1])**2)
+    print(f"error: {err:.3f}m")
 
 
 ## KLD adaptive sampling params
@@ -322,19 +325,19 @@ def kld_resample(particles, map_info):
     return new_p
 
 
-p_spread = initialize_particles(500, map_info)
-p_spread_kld = kld_resample(p_spread, map_info)
-print(f"spread {len(p_spread)}, {len(p_spread_kld)}")
+    p_spread = initialize_particles(500, map_info)
+    p_spread_kld = kld_resample(p_spread, map_info)
+    print(f"spread {len(p_spread)}, {len(p_spread_kld)}")
 
-p_conv = []
-for i in range(500):
-    x = -0.5 + random.uniform(-0.1, 0.1)
-    y = -0.5 + random.uniform(-0.1, 0.1)
-    theta = random.uniform(-0.2, 0.2)
-    p_conv.append(Particle(x, y, theta, 1.0/500))
+    p_conv = []
+    for i in range(500):
+        x = -0.5 + random.uniform(-0.1, 0.1)
+        y = -0.5 + random.uniform(-0.1, 0.1)
+        theta = random.uniform(-0.2, 0.2)
+        p_conv.append(Particle(x, y, theta, 1.0/500))
 
-p_conv_kld = kld_resample(p_conv, map_info)
-print(f"converged {len(p_conv)} , {len(p_conv_kld)}")
+    p_conv_kld = kld_resample(p_conv, map_info)
+    print(f"converged {len(p_conv)} , {len(p_conv_kld)}")
 
 
 ## test the integrations on the sensor_data
@@ -370,5 +373,5 @@ def run_amcl(sensor_data, map_info, n_particles=500, use_kld=True):
 
     return estimates
 
-estimates = run_amcl(sensor_data, map_info, n_particles=100, use_kld=True)
+    estimates = run_amcl(sensor_data, map_info, n_particles=100, use_kld=True)
 
