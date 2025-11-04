@@ -4,13 +4,17 @@ import csv
 import math
 import sys
 import random 
-import os # Added os for path joining
+import os 
+import yaml 
+from PIL import Image 
+from dataclasses import dataclass 
+from scipy.ndimage import distance_transform_edt 
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
 # All settings are in this dictionary. Update the paths to match your system.
-# *** IMPORTANT: Update all 3 paths below to be FULL, ABSOLUTE paths ***
+# *** IMPORTANT: All 3 paths MUST be FULL, ABSOLUTE paths ***
 # -----------------------------------------------------------------------------
 CONFIG = {
     'data': {
@@ -28,40 +32,211 @@ CONFIG = {
         'lidar': {
             'num_rays': 360,     # Total rays in the scan
             'fov_deg': 360,      # Field of view in degrees
-            'sparsity': 10,      # Use 1-in-every-X rays (e.g., 10)
+            'sparsity': 10,      # <-- EDITED: Use 1-in-10 rays (36 total) for speed.
         }
     },
     'localization': {
-        'likelihood_sigma': 0.5,     # Std. dev. for likelihood field (meters)
+        'likelihood_sigma': 0.1,     # <-- EDITED: Sharpened sensor model (10cm blur)
         'likelihood_max_dist': 2.0,  # Max distance for likelihood (meters)
-        'motion_diffusion_factor': 0.1, # How much to "blur" on prediction
+        'motion_diffusion_factor': 0.01, # <-- EDITED: Trust our (perfect) motion model more
     }
 }
 # -----------------------------------------------------------------------------
+# END OF CONFIGURATION
+# -----------------------------------------------------------------------------
 
 
-# Add the path to the libraries folder
-# Using the absolute path you provided to find 'localization_utils'
-sys.path.append(r'C:\Users\Rohit\Desktop\Intelligent Robotics\G23-Intelligent-Robotics\libraries')
+# -----------------------------------------------------------------------------
+# HELPER FUNCTIONS (Previously in localization_utils)
+# -----------------------------------------------------------------------------
 
+@dataclass
+class MapInfo:
+    """ Container for map metadata """
+    occupancy_grid: np.ndarray
+    resolution: float
+    origin_x: float
+    origin_y: float
+    width: int
+    height: int
+    occupied_thresh: float
+    free_thresh: float
 
-# Import all the utilities from your new package
-try:
-    # --- UPDATED IMPORTS ---
-    # We now import directly from the .py files inside the package
-    # (as shown in your screenshot). This is more robust.
-    from localization_utils.map_loader import MapInfo, load_map
-    from localization_utils.data_format import load_sensor_data
-    from localization_utils.likelihood_field import (
-        compute_likelihood_field, 
+def load_map(pgm_path, yaml_path):
+    """ load map from pgm and yaml files """
+    # load yaml metadata
+    with open(yaml_path, 'r') as f:
+        meta = yaml.safe_load(f)
+
+    res = meta['resolution']
+    origin = meta['origin']
+    ox, oy = origin[0], origin[1]
+    occ_thresh = meta.get('occupied_thresh', 0.65)
+    free_thresh = meta.get('free_thresh', 0.25)
+    negate = meta.get('negate', 0)
+
+    # load pgm image
+    img = Image.open(pgm_path)
+    img_arr = np.array(img)
+
+    # convert to occupancy grid - trinary mode
+    # pgm: 255=white=free, 0=black=occupied
+    norm = img_arr / 255.0
+    occ_grid = np.where(norm > (1 - free_thresh), 0.0,
+                        np.where(norm < occ_thresh, 1.0, 0.5))
+
+    h, w = occ_grid.shape
+
+    return MapInfo(
+        occupancy_grid=occ_grid,
+        resolution=res,
+        origin_x=ox,
+        origin_y=oy,
+        width=w,
+        height=h,
+        occupied_thresh=occ_thresh,
+        free_thresh=free_thresh
     )
-    from localization_utils.geometry import grid_to_world, world_to_grid
 
-except ImportError as e:
-    print(f"Error: Could not import from the 'localization_utils' package: {e}")
-    print(f"Tried to find it in: {sys.path[-1]}")
-    print("Please ensure this path is correct and contains the 'localization_utils' folder.")
-    exit(1)
+def load_sensor_data(config):
+    """
+    Loads clean sensor data from the specified CSV file.
+    Assumes CSV format: timestamp, range_0, ..., range_359, v, w, gt_x, gt_y, gt_theta
+    """
+    csv_file_path = config['data']['sensor_data_csv_path']
+    num_rays = config['sensors']['lidar']['num_rays']
+    
+    sensor_log = []
+    
+    print(f"Loading sensor data from: {csv_file_path}")
+    try:
+        with open(csv_file_path, 'r') as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            
+            # Find column indices
+            try:
+                ts_idx = header.index('timestamp')
+                range_start_idx = header.index('range_0')
+                gt_x_idx = header.index('gt_x')
+                gt_y_idx = header.index('gt_y')
+                gt_theta_idx = header.index('gt_theta')
+            except ValueError as e:
+                print(f"Error: Missing required column in CSV: {e}")
+                print(f"Header found: {header}")
+                return None
+                
+            range_end_idx = range_start_idx + num_rays
+            if range_end_idx > len(header):
+                print(f"Error: CSV header does not have {num_rays} 'range_...' columns.")
+                return None
+
+            # Read data
+            for row in reader:
+                try:
+                    data_point = {
+                        'timestamp': float(row[ts_idx]),
+                        'ranges': np.array([float(r) for r in row[range_start_idx:range_end_idx]]),
+                        'pose': (
+                            float(row[gt_x_idx]),
+                            float(row[gt_y_idx]),
+                            float(row[gt_theta_idx])
+                        )
+                    }
+                    sensor_log.append(data_point)
+                except (ValueError, IndexError):
+                    print(f"Warning: Skipping malformed row: {row}")
+                    
+    except FileNotFoundError:
+        print(f"Error: Sensor data file not found at: {csv_file_path}")
+        print("Please check the 'sensor_data_csv_path' in the CONFIG dictionary.")
+        return None
+    except Exception as e:
+        print(f"Error loading sensor data: {e}")
+        return None
+
+    return sensor_log
+
+def world_to_grid(x, y, map_info):
+    """ world coords (meters) to grid coords (pixels) """
+    grid_x = int(round((x - map_info.origin_x) / map_info.resolution))
+    grid_y = int(round((y - map_info.origin_y) / map_info.resolution))
+    return grid_x, grid_y
+
+def grid_to_world(grid_x, grid_y, map_info):
+    """ grid coords to world coords """
+    # We add 0.5 to get the center of the cell
+    x = (grid_x + 0.5) * map_info.resolution + map_info.origin_x
+    y = (grid_y + 0.5) * map_info.resolution + map_info.origin_y
+    return x, y
+
+def compute_likelihood_field(map_info, sigma=0.1, max_dist=2.0):
+    """ precompute likelihood field for sensor model """
+    # binary obstacle map
+    obs = (map_info.occupancy_grid > 0.5).astype(np.float32)
+
+    # distance transform - euclidean dist to nearest obstacle
+    dist = distance_transform_edt(1 - obs)
+
+    # convert to meters
+    dist_m = dist * map_info.resolution
+
+    # gaussian around obstacles
+    sig_cells = sigma / map_info.resolution
+    field = np.exp(-0.5 * (dist / sig_cells) ** 2)
+
+    # clamp far ditsances
+    max_cells = max_dist / map_info.resolution
+    field[dist > max_cells] = 0.01
+
+    # normalize
+    field = field / field.max()
+
+    return field
+
+def compute_scan_likelihood_field(scan_ranges, scan_angles, robot_x, robot_y, robot_theta,
+                                  map_info, likelihood_field):
+    """
+    Compute total likelihood of a scan using pre-computed likelihood field.
+    Returns the *log-likelihood*.
+    """
+    log_likelihood = 0.0
+    num_valid = 0
+
+    for r, a in zip(scan_ranges, scan_angles):
+        # Skip invalid ranges
+        if r < 0.12 or r > 3.5: # Using typical TB3 lidar min/max
+            continue
+
+        # Endpoint of ray in world frame
+        global_angle = robot_theta + a
+        px = robot_x + r * np.cos(global_angle)
+        py = robot_y + r * np.sin(global_angle)
+
+        # Convert to grid
+        gx, gy = world_to_grid(px, py, map_info) # Calls local function
+
+        # Check bounds
+        if 0 <= gx < map_info.width and 0 <= gy < map_info.height:
+            # Lookup pre-computed likelihood
+            p = likelihood_field[gy, gx]
+            # Avoid log(0)
+            p = max(p, 1e-10)
+            log_likelihood += np.log(p)
+            num_valid += 1
+        # else:
+            # Ray endpoint is off the map, penalize slightly?
+            # log_likelihood -= 0.1 
+
+    # Normalize by number of valid beams
+    if num_valid > 0:
+        return log_likelihood / num_valid
+    else:
+        return 0.0 # No valid beams
+
+# -----------------------------------------------------------------------------
+# END OF HELPER FUNCTIONS
+# -----------------------------------------------------------------------------
 
 
 def prediction_step(belief_grid, motion, map_info, diffusion_factor):
@@ -102,12 +277,16 @@ def prediction_step(belief_grid, motion, map_info, diffusion_factor):
         return final_belief / total_prob
     else:
         # Failsafe: re-initialize if all probability is lost
-        return np.ones_like(belief_grid) / belief_grid.size
+        print("  Warning: Prediction step resulted in zero probability. Re-initializing.")
+        final_belief = np.ones_like(belief_grid)
+        final_belief[map_info.occupancy_grid > 0.5] = 0.0
+        return final_belief / np.sum(final_belief)
 
-def correction_step(belief_grid, sensor_data, map_info, likelihood_field, config):
+def correction_step(belief_grid, sensor_data, map_info, likelihood_field, config, verbose=False):
     """
     Updates the belief grid based on the sensor model P(z_t | x_t)
     using the pre-computed likelihood field.
+    'verbose' controls if this function prints its status.
     """
     
     lidar_config = config['sensors']['lidar']
@@ -133,32 +312,64 @@ def correction_step(belief_grid, sensor_data, map_info, likelihood_field, config
     # Create a likelihood grid (log-probabilities)
     log_likelihood_grid = np.zeros_like(belief_grid)
     
-    print("  Running correction step (using likelihood field)...")
+    if verbose:
+        print("  Running correction step (using likelihood field)...")
     
-    for y in range(map_info.height):
-        for x in range(map_info.width):
-            if map_info.occupancy_grid[y, x] > 0.5:
-                log_likelihood_grid[y, x] = -np.inf # Impossible to be in a wall
-                continue
+    # Vectorized approach (much faster than nested loops)
+    
+    # Create grid of all possible cell coordinates
+    y_coords, x_coords = np.indices(belief_grid.shape)
+    
+    # Convert all grid coords to world coords
+    # Note: grid_to_world is slightly modified to handle arrays
+    wx, wy = grid_to_world(x_coords, y_coords, map_info)
+    
+    # Initialize log-likelihoods
+    log_likelihood_grid = np.full_like(belief_grid, -np.inf) # Start all at -inf
+    
+    # --- EDITED: OPTIMIZATION ---
+    # Find all valid cells (not in an obstacle AND have some belief)
+    # This check reduces the number of cells to compute likelihood for,
+    # dramatically speeding up the process.
+    valid_mask = (map_info.occupancy_grid < 0.5) & (belief_grid > 1e-9)
+    # --- END OF EDIT ---
+    
+    valid_y = y_coords[valid_mask]
+    valid_x = x_coords[valid_mask]
+    valid_wx = wx[valid_mask]
+    valid_wy = wy[valid_mask]
 
-            # Get world coordinates for the center of this grid cell
-            wx, wy = grid_to_world(x, y, map_info)
-            
-            # Calculate log-likelihood P(z | x)
-            # This is MUCH faster than ray-casting
-            log_p = compute_scan_likelihood_field(
-                sparse_ranges, sparse_angles, 
-                wx, wy, gt_theta_rad,
-                map_info, likelihood_field
-            )
-            log_likelihood_grid[y, x] = log_p
-
-    print("  Correction step done.")
+    # Calculate log-likelihood for all valid cells at once
+    # This is the slowest part
+    log_p_values = []
+    for wx_cell, wy_cell in zip(valid_wx, valid_wy):
+        log_p = compute_scan_likelihood_field(
+            sparse_ranges, sparse_angles, 
+            wx_cell, wy_cell, gt_theta_rad,
+            map_info, likelihood_field
+        )
+        log_p_values.append(log_p)
+    
+    # Assign computed log-likelihoods back to the grid
+    if len(valid_y) > 0:
+        log_likelihood_grid[valid_y, valid_x] = log_p_values
+    
+    if verbose:
+        print(f"  Correction step done. (Computed likelihood for {len(valid_y)} cells)")
 
     # Convert from log-probability to probability
     # Subtract max for numerical stability
-    # Find the max finite log-likelihood
-    max_log_like = np.max(log_likelihood_grid[np.isfinite(log_likelihood_grid)])
+    if len(valid_y) > 0:
+        max_log_like = np.max(log_likelihood_grid[np.isfinite(log_likelihood_grid)])
+    else:
+        max_log_like = 0.0 # No valid cells, nothing to compute
+    
+    # Handle case where all log-likelihoods might be -inf
+    if not np.isfinite(max_log_like):
+        if verbose:
+            print("  Warning: All cells have -inf log-likelihood. Belief may collapse.")
+        max_log_like = 0.0
+
     likelihood_grid = np.exp(log_likelihood_grid - max_log_like)
     
     # Update belief: Bel(x_t) = eta * P(z_t | x_t) * Bel_bar(x_t)
@@ -170,14 +381,16 @@ def correction_step(belief_grid, sensor_data, map_info, likelihood_field, config
         return updated_belief / total_prob
     else:
         # Failsafe
-        print("  Warning: Belief collapsed. Re-initializing.")
-        return np.ones_like(belief_grid) / belief_grid.size
+        if verbose:
+            print("  Warning: Belief collapsed. Re-initializing.")
+        final_belief = np.ones_like(belief_grid)
+        final_belief[map_info.occupancy_grid > 0.5] = 0.0
+        return final_belief / np.sum(final_belief)
 
 def main():
-    # Removed config loading
-    print(f"Loading configuration from internal CONFIG dictionary...")
     # Use the global CONFIG object
     config = CONFIG 
+    print(f"Loading configuration from internal CONFIG dictionary...")
     
     # --- 1. Load Map ---
     print("\nLoading map...")
@@ -190,6 +403,9 @@ def main():
     except FileNotFoundError as e:
         print(f"Error loading map: {e}")
         print("Please ensure 'map_pgm_path' and 'map_yaml_path' in the global CONFIG dictionary are correct.")
+        return
+    except Exception as e:
+        print(f"An error occurred loading the map: {e}")
         return
 
     # --- 2. Pre-compute Likelihood Field ---
@@ -208,36 +424,56 @@ def main():
     belief_grid = np.ones((map_info.height, map_info.width))
     # Remove belief from occupied cells
     belief_grid[map_info.occupancy_grid > 0.5] = 0.0
+    
+    if np.sum(belief_grid) == 0:
+        print("Error: Map seems to be entirely obstacles. Cannot initialize belief.")
+        return
+        
     belief_grid = belief_grid / np.sum(belief_grid)
     
     # --- 4. Load Sensor Data ---
     print("Loading sensor data...")
-    # We use the 'load_sensor_data' function
-    # It will now get the path from the global CONFIG dict
     sensor_log = load_sensor_data(config)
     if not sensor_log:
         print("Failed to load sensor data. Exiting.")
         return
-    print(f"Loaded {len(sensor_log)} data points.")
+    print(f"Loaded {len(sensor_log)} full data points.")
+    
+    # --- EDITED: BATCH THE DATA ---
+    # Filter the sensor log to only keep every 50th step
+    batch_interval = 50
+    sensor_log = sensor_log[::batch_interval]
+    print(f"Batched data to {len(sensor_log)} steps (1 every {batch_interval}).")
+    # --- END OF EDIT ---
 
     # --- 5. Run Localization Loop ---
     last_gt_pose = None
     
+    # --- EDITED: Loop processing ---
+    total_steps = len(sensor_log)
+    # Removed print_interval, we now print every step of the batched log
+    
     for i, sensor_data in enumerate(sensor_log):
-        print(f"\n--- Processing Timestamp {sensor_data['timestamp']} (Step {i+1}/{len(sensor_log)}) ---")
+        # We will now print every step, since the log is already batched
+        print(f"\n--- Processing Timestamp {sensor_data['timestamp']} (Step {i+1}/{total_steps}) ---")
+        
         start_step_time = time.time()
         
         current_gt_pose = sensor_data['pose']
         gt_x_m, gt_y_m, gt_theta_rad = current_gt_pose
+        
+        # We need to use the *exact* same world_to_grid function for GT
         gt_grid_x, gt_grid_y = world_to_grid(gt_x_m, gt_y_m, map_info)
 
         # --- Prediction Step (Motion Model) ---
         if last_gt_pose:
+            # This now calculates the total motion over the last 50 steps
             dx_m = current_gt_pose[0] - last_gt_pose[0]
             dy_m = current_gt_pose[1] - last_gt_pose[1]
             motion = (dx_m, dy_m)
             
             print(f"  Applying motion: dx={dx_m:.2f}m, dy={dy_m:.2f}m")
+                
             belief_grid = prediction_step(
                 belief_grid, 
                 motion, 
@@ -253,10 +489,11 @@ def main():
             sensor_data, 
             map_info, 
             likelihood_field, 
-            config
+            config,
+            verbose=True # Always print correction step details
         )
 
-        # --- Find Best Estimate ---
+        # --- Find Best Estimate & Print (only on print steps) ---
         est_grid_y, est_grid_x = np.unravel_index(
             np.argmax(belief_grid), 
             belief_grid.shape
@@ -268,7 +505,7 @@ def main():
         if 0 <= gt_grid_x < map_info.width and 0 <= gt_grid_y < map_info.height:
              prob_at_gt = belief_grid[gt_grid_y, gt_grid_x]
         else:
-            print("  Warning: Ground truth is outside map bounds.")
+            print(f"  Warning: Ground truth ({gt_grid_x}, {gt_grid_y}) is outside map bounds (0-{map_info.width}, 0-{map_info.height}).")
 
         # --- 6. Print and Compare ---
         print("\n  --- Results ---")
