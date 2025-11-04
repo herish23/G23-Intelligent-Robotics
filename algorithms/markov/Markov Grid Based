@@ -3,8 +3,7 @@ import time
 import csv
 import math
 
-# Import all the utilities from your new package
-try:
+sys.path.append("../../libraries")
     from localization_utils import (
         load_config,
         print_config_summary,
