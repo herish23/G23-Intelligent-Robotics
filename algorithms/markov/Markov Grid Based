@@ -1,297 +1,243 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.ndimage import shift
-import os
+import time
 import csv
+import math
 
-# --- 1. CONFIGURATION (MUST BE SET BY YOU) ---
+# Import all the utilities from your new package
+try:
+    from localization_utils import (
+        load_config,
+        print_config_summary,
+        get_output_paths,
+        MapInfo,
+        load_map,
+        load_sensor_data,
+        compute_likelihood_field,
+        compute_scan_likelihood_field,
+        grid_to_world,
+        world_to_grid
+    )
+except ImportError:
+    print("Error: Could not import the 'localization_utils' package.")
+    print("Please ensure the 'localization_utils' directory is in the same folder as this script.")
+    exit(1)
 
-# CRITICAL: This MUST match your map file. (e.g., if your map is 20m wide and 400 pixels, resolution is 20/400 = 0.05)
-MAP_RESOLUTION_METERS_PER_CELL = 0.05 
 
-# Set the max range of your sensor in METERS (to match CSV data)
-MAX_RANGE_METERS = 20.0 
-
-# The CSV file to load
-SENSOR_DATA_FILE = 'sensor_data_clean.csv'
-
-# --- 2. MAP & SENSOR LOADING ---
-
-def load_map_from_csv(r'C:\Users\Rohit\Desktop\Intelligent Robotics\G23-Intelligent-Robotics\data\sensor_data_clean.csv):
+def prediction_step(belief_grid, motion, map_info, diffusion_factor):
     """
-    Loads a map from a simple CSV file.
-    Assumes 1 = WALL, 0 = FREE.
+    Updates the belief grid based on a motion model P(x_t | u_t, x_t-1).
+    'motion' is (dx_m, dy_m).
     """
-    try:
-        grid = np.genfromtxt(filepath, delimiter=',', dtype=float)
-        # Ensure 1s are WALL and 0s are FREE
-        grid[grid != 0] = 1.0 # Set all non-zero to WALL
-        grid = np.nan_to_num(grid, nan=1.0) # Treat empty/bad cells as WALL
-        print(f"Successfully loaded map from {filepath} with shape {grid.shape}")
-        return grid
-    except Exception as e:
-        print(f"Error loading map file {filepath}: {e}")
-        print("Falling back to default map.")
-        return None
+    dx_m, dy_m = motion
+    
+    # Convert motion from meters to grid cells
+    dx_cells = int(round(dx_m / map_info.resolution))
+    dy_cells = int(round(dy_m / map_info.resolution))
+    
+    # This is a simple "shift" model.
+    predicted_belief = np.roll(belief_grid, (dy_cells, dx_cells), axis=(0, 1))
+    
+    # Zero out probabilities that "leaked" from the other side
+    if dy_cells > 0:
+        predicted_belief[:dy_cells, :] = 0
+    elif dy_cells < 0:
+        predicted_belief[dy_cells:, :] = 0
+    if dx_cells > 0:
+        predicted_belief[:, :dx_cells] = 0
+    elif dx_cells < 0:
+        predicted_belief[:, dx_cells:] = 0
 
-def create_map():
-    """Creates the default 2D map if no file is loaded."""
-    GRID_SIZE = 40
-    WALL = 1.0
-    FREE = 0.0
-    grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=float)
-    grid[0, :] = WALL
-    grid[-1, :] = WALL
-    grid[:, 0] = WALL
-    grid[:, -1] = WALL
-    grid[10:30, 15] = WALL
-    grid[10:20, 25] = WALL
-    grid[30, 20:35] = WALL
-    grid[15, 20:30] = WALL
-    grid[1:10, 30] = WALL
-    print("Using default procedural map.")
-    return grid
+    # Add a simple diffusion model for motion noise (prevents particle deprivation)
+    uniform_prob = 1.0 / belief_grid.size
+    final_belief = predicted_belief * (1.0 - diffusion_factor) + \
+                   (uniform_prob * diffusion_factor)
+    
+    # Mask out any probabilities in occupied cells
+    final_belief[map_info.occupancy_grid > 0.5] = 0.0
 
-def load_sensor_data(filepath):
-    """Loads the header and all data rows from the sensor CSV."""
-    if not os.path.exists(filepath):
-        print(f"FATAL ERROR: Sensor file not found at {filepath}")
-        return None, None
-        
-    with open(filepath, 'r') as f:
-        reader = csv.reader(f)
-        try:
-            header = next(reader)
-            data = [row for row in reader]
-            print(f"Loaded {len(data)} readings from {filepath}")
-            return header, data
-        except StopIteration:
-            print(f"FATAL ERROR: Sensor file {filepath} is empty.")
-            return None, None
-        except Exception as e:
-            print(f"FATAL ERROR: Could not read {filepath}. Error: {e}")
-            return None, None
-
-# --- 3. PROBABILITY & GEOMETRY (Your Core Logic) ---
-
-P_HIT = 0.9
-P_MISS = 0.01
-P_MAX_RANGE = 0.05
-
-def initialize_belief(grid):
-    """Initializes the probability distribution (belief) uniformly over free space."""
-    belief = np.where(grid == 0.0, 1.0, 0.0) # 0.0 is FREE
-    total_free_cells = np.sum(belief)
-    if total_free_cells > 0:
-        belief /= total_free_cells
+    # Normalize the belief
+    total_prob = np.sum(final_belief)
+    if total_prob > 0:
+        return final_belief / total_prob
     else:
-        print("Error: Map has no free space!")
-        belief.fill(1.0 / grid.size)
-    return belief
+        # Failsafe: re-initialize if all probability is lost
+        return np.ones_like(belief_grid) / belief_grid.size
 
-def ray_cast_distance(grid, grid_size, max_range_cells, x, y, dx, dy):
+def correction_step(belief_grid, sensor_data, map_info, likelihood_field, config):
     """
-    Simulates a ray cast in GRID CELL units.
+    Updates the belief grid based on the sensor model P(z_t | x_t)
+    using the pre-computed likelihood field.
     """
-    fx, fy = float(x), float(y)
-    dist = 0.0
-    max_steps = int(max_range_cells) * 2
+    
+    lidar_config = config['sensors']['lidar']
+    lidar_ranges = sensor_data['ranges']
+    
+    # Create an array of lidar angles
+    angles = np.linspace(
+        -math.radians(lidar_config['fov_deg']) / 2.0,
+        math.radians(lidar_config['fov_deg']) / 2.0,
+        lidar_config['num_rays']
+    )
+    
+    # Apply sparsity
+    sparse_indices = np.arange(0, len(lidar_ranges), lidar_config['sparsity'])
+    sparse_ranges = lidar_ranges[sparse_indices]
+    sparse_angles = angles[sparse_indices]
 
-    for _ in range(max_steps):
-        fx += dx
-        fy += dy
-        ix, iy = int(round(fx)), int(round(fy))
+    # ** This is the 2D "cheat" **
+    # We use the ground truth theta for the sensor model.
+    # This simplifies the problem from 3D (x,y,theta) to 2D (x,y).
+    gt_theta_rad = sensor_data['pose'][2]
 
-        if not (0 <= ix < grid_size and 0 <= iy < grid_size):
-            return max_range_cells # Hit map boundary
-        if grid[iy, ix] == 1.0: # 1.0 is WALL
-            return np.sqrt((ix - x)**2 + (iy - y)**2) # Hit wall
+    # Create a likelihood grid (log-probabilities)
+    log_likelihood_grid = np.zeros_like(belief_grid)
+    
+    print("  Running correction step (using likelihood field)...")
+    
+    for y in range(map_info.height):
+        for x in range(map_info.width):
+            if map_info.occupancy_grid[y, x] > 0.5:
+                log_likelihood_grid[y, x] = -np.inf # Impossible to be in a wall
+                continue
 
-        dist += np.sqrt(dx**2 + dy**2)
-        if dist > max_range_cells:
-            return max_range_cells
-    return max_range_cells
+            # Get world coordinates for the center of this grid cell
+            wx, wy = grid_to_world(x, y, map_info)
+            
+            # Calculate log-likelihood P(z | x)
+            # This is MUCH faster than ray-casting
+            log_p = compute_scan_likelihood_field(
+                sparse_ranges, sparse_angles, 
+                wx, wy, gt_theta_rad,
+                map_info, likelihood_field
+            )
+            log_likelihood_grid[y, x] = log_p
 
-def get_expected_measurement(grid, grid_size, max_range_cells, pos, angle_deg):
-    """Calculates the expected range measurement in GRID CELL units."""
-    x, y = pos
-    angle_rad = np.deg2rad(angle_deg)
-    dx = np.cos(angle_rad) * 0.5 # Step size in cells
-    dy = np.sin(angle_rad) * 0.5
-    return ray_cast_distance(grid, grid_size, max_range_cells, x, y, dx, dy)
+    print("  Correction step done.")
 
-def update_prediction(belief, motion_delta, grid):
-    """
-    Updates the belief state based on the robot's motion (Prediction Step).
-    --- THIS IS NOT USED IN THIS SCRIPT, as we have no motion data ---
-    """
-    dx, dy = motion_delta
-    grid_size = grid.shape[0]
-    new_belief = shift(belief, (-dy, -dx), mode='wrap', cval=0)
-
-    blurred_belief = np.copy(new_belief)
-    for i in range(1, grid_size - 1):
-        for j in range(1, grid_size - 1):
-            sum_prob = new_belief[i, j] * 0.4
-            sum_prob += np.sum(new_belief[i-1:i+2, j-1:j+2]) * 0.0667
-            blurred_belief[i, j] = sum_prob
-
-    blurred_belief[grid == 1.0] = 0.0 # 1.0 is WALL
-
-    sum_belief = np.sum(blurred_belief)
-    if sum_belief <= 1e-12:
-        return initialize_belief(grid)
-    return blurred_belief / np.sum(blurred_belief)
-
-def update_correction(belief, grid, grid_size, max_range_cells, measurement_cells, angle_deg):
-    """
-    Updates the belief state based on a new measurement (Correction Step).
-    All logic is in GRID CELL units.
-    """
-    new_belief = np.zeros_like(belief)
-    max_range_check = max_range_cells * 0.95
-
-    for y in range(grid_size):
-        for x in range(grid_size):
-            if grid[y, x] == 0.0: # 0.0 is FREE
-                # 1. Calculate expected measurement in CELLS
-                expected_dist_cells = get_expected_measurement(grid, grid_size, max_range_cells, (x, y), angle_deg)
-
-                # 2. Calculate Likelihood P(measurement | pos)
-                likelihood = 0.0
-                if measurement_cells >= max_range_check:
-                    if expected_dist_cells >= max_range_check:
-                        likelihood = P_HIT
-                    else:
-                        likelihood = P_MAX_RANGE
-                else:
-                    error = abs(measurement_cells - expected_dist_cells)
-                    if error < 1.0:
-                        likelihood = P_HIT * np.exp(-0.5 * error**2)
-                    elif error > 10.0:
-                        likelihood = P_MISS
-                    else:
-                        likelihood = P_MISS + (P_HIT - P_MISS) * np.exp(-0.05 * error)
-                
-                new_belief[y, x] = likelihood * belief[y, x]
-
-    # 4. Normalize
-    sum_belief = np.sum(new_belief)
-    if sum_belief > 0:
-        return new_belief / sum_belief
+    # Convert from log-probability to probability
+    # Subtract max for numerical stability
+    likelihood_grid = np.exp(log_likelihood_grid - np.max(log_likelihood_grid))
+    
+    # Update belief: Bel(x_t) = eta * P(z_t | x_t) * Bel_bar(x_t)
+    updated_belief = belief_grid * likelihood_grid
+    
+    # Normalize the final belief
+    total_prob = np.sum(updated_belief)
+    if total_prob > 0:
+        return updated_belief / total_prob
     else:
-        print(f"Warning: Belief collapsed on angle {angle_deg}. Re-initializing.")
-        return initialize_belief(grid)
-
-# --- 4. VISUALIZATION ---
-
-def plot_state(fig, grid, belief, title):
-    """Plots the state onto the existing figure object 'fig'."""
-    fig.clf() 
-
-    # Subplot 1: Map
-    ax1 = fig.add_subplot(1, 2, 1)
-    ax1.imshow(grid, cmap='binary', origin='lower')
-    ax1.set_title("Environment Map")
-    ax1.set_xticks([]), ax1.set_yticks([])
-
-    # Subplot 2: Belief Distribution
-    ax2 = fig.add_subplot(1, 2, 2)
-    masked_belief = np.ma.masked_where(belief <= 1e-10, belief)
-    vmax = np.max(belief) if np.max(belief) > 0 else 1.0
-    
-    ax2.imshow(grid, cmap='binary', origin='lower') # Show map underneath
-    im = ax2.imshow(masked_belief, cmap='viridis', origin='lower', vmin=0, vmax=vmax, alpha=0.8)
-    
-    ax2.set_title(title)
-    ax2.set_xticks([]), ax2.set_yticks([])
-    
-    fig.colorbar(im, ax=ax2, label='Probability')
-    plt.tight_layout()
-    plt.pause(0.1) # Pause to allow plot to update
-
-# --- 5. MAIN SIMULATION LOOP ---
+        # Failsafe
+        print("  Warning: Belief collapsed. Re-initializing.")
+        return np.ones_like(belief_grid) / belief_grid.size
 
 def main():
-    print("--- Starting Offline Localization (Kidnapped Robot) ---")
+    config_path = 'config.yaml'
+    print(f"Loading configuration from {config_path}...")
+    config = load_config(config_path)
+    print_config_summary(config)
     
-    # --- A. Load Map ---
-    # To use your own map:
-    # 1. Create a file 'my_map.csv' (1s for walls, 0s for free space)
-    # 2. Uncomment the next line:
-    
-    # The 'create_map()' function has been removed as requested.
-    # You MUST provide 'my_map.csv' for this script to work.
-    grid = load_map_from_csv('my_map.csv')
-    
-    # For now, we use the default map
-    # grid = create_map() - This line has been removed.
-    
-    if grid is None:
-        print("FATAL ERROR: Map file 'my_map.csv' not found or failed to load. Exiting.")
+    # --- 1. Load Map ---
+    print("\nLoading map...")
+    try:
+        map_info = load_map(
+            config['data']['map_pgm_path'], 
+            config['data']['map_yaml_path']
+        )
+        print(f"Map loaded: {map_info.width}x{map_info.height} cells @ {map_info.resolution:.3f} m/cell")
+    except FileNotFoundError as e:
+        print(f"Error loading map: {e}")
+        print("Please ensure 'map_pgm_path' and 'map_yaml_path' in config.yaml are correct.")
+        print("You must provide the .pgm file yourself.")
         return
 
-    GRID_SIZE = grid.shape[0] # Get size from the loaded map
-    # Convert MAX_RANGE from meters to cells
-    MAX_RANGE_CELLS = MAX_RANGE_METERS / MAP_RESOLUTION_METERS_PER_CELL
+    # --- 2. Pre-compute Likelihood Field ---
+    print("Pre-computing likelihood field (this may take a moment)...")
+    start_time = time.time()
+    likelihood_field = compute_likelihood_field(
+        map_info, 
+        config['localization']['likelihood_sigma'],
+        config['localization']['likelihood_max_dist']
+    )
+    print(f"Likelihood field computed in {time.time() - start_time:.2f}s")
     
-    # --- B. Load Sensor Data ---
-    header, sensor_data = load_sensor_data(SENSOR_DATA_FILE)
-    if header is None:
+    # --- 3. Initialize Belief ---
+    print("Initializing belief grid...")
+    # P(x_0) = Uniform distribution
+    belief_grid = np.ones((map_info.height, map_info.width))
+    # Remove belief from occupied cells
+    belief_grid[map_info.occupancy_grid > 0.5] = 0.0
+    belief_grid = belief_grid / np.sum(belief_grid)
+    
+    # --- 4. Load Sensor Data ---
+    print("Loading sensor data...")
+    # We use the 'load_sensor_data' function we created in data_format.py
+    # This assumes the CSV has 'gt_x', 'gt_y', 'gt_theta', and 'range_...' columns
+    sensor_log = load_sensor_data(config)
+    if not sensor_log:
+        print("Failed to load sensor data. Exiting.")
         return
+    print(f"Loaded {len(sensor_log)} data points.")
 
-    # We only need one reading to localize
-    first_reading_row = sensor_data[0]
-    print(f"Using first sensor reading from timestamp: {first_reading_row[0]}")
+    # --- 5. Run Localization Loop ---
+    last_gt_pose = None
     
-    # Get all range readings (skip timestamp at index 0)
-    ranges_meters = np.array(first_reading_row[1:], dtype=float)
-    
-    # Clean up data: replace inf, nan, or 0.0 with max range
-    ranges_meters[np.isinf(ranges_meters)] = MAX_RANGE_METERS
-    ranges_meters[np.isnan(ranges_meters)] = MAX_RANGE_METERS
-    ranges_meters[ranges_meters == 0.0] = MAX_RANGE_METERS
-
-    # --- C. Initialize Belief & Plot ---
-    plt.ion()
-    fig = plt.figure(figsize=(10, 5))
-    belief = initialize_belief(grid)
-    plot_state(fig, grid, belief, "Initial Uniform Belief")
-
-    # --- D. Run Correction Step for all readings ---
-    print("Localizing robot based on single 360-degree scan...")
-    
-    num_readings = len(ranges_meters)
-    angle_step = 360.0 / num_readings
-    
-    # We can speed this up by sampling the readings
-    # (e.g., use every 5th reading)
-    for i in range(0, num_readings, 5): 
-        measurement_meters = ranges_meters[i]
-        angle_deg = i * angle_step
+    for i, sensor_data in enumerate(sensor_log):
+        print(f"\n--- Processing Timestamp {sensor_data['timestamp']} (Step {i+1}/{len(sensor_log)}) ---")
+        start_step_time = time.time()
         
-        # Convert this one reading from meters to grid cells
-        measurement_cells = measurement_meters / MAP_RESOLUTION_METERS_PER_CELL
-        
-        # Run the correction step
-        belief = update_correction(belief, grid, GRID_SIZE, MAX_RANGE_CELLS, measurement_cells, angle_deg)
-        
-        # Update plot every 20 readings to show progress
-        if i % 20 == 0:
-            print(f"  ... applying reading {i}/{num_readings} (angle {angle_deg:.0f})")
-            plot_state(fig, grid, belief, f"After {i} Sensor Readings")
+        current_gt_pose = sensor_data['pose']
+        gt_x_m, gt_y_m, gt_theta_rad = current_gt_pose
+        gt_grid_x, gt_grid_y = world_to_grid(gt_x_m, gt_y_m, map_info)
 
-    # --- E. Show Final Result ---
-    print("Localization complete.")
-    plot_state(fig, grid, belief, "Final Localized Belief")
-    
-    est_y, est_x = np.unravel_index(np.argmax(belief), belief.shape)
-    confidence = np.max(belief)
-    print(f"  > Best Estimate: ({est_x}, {est_y})")
-    print(f"  > Confidence: {confidence*100:.2f}%")
-    
-    plt.ioff()
-    plt.show()
+        # --- Prediction Step (Motion Model) ---
+        if last_gt_pose:
+            dx_m = current_gt_pose[0] - last_gt_pose[0]
+            dy_m = current_gt_pose[1] - last_gt_pose[1]
+            motion = (dx_m, dy_m)
+            
+            print(f"  Applying motion: dx={dx_m:.2f}m, dy={dy_m:.2f}m")
+            belief_grid = prediction_step(
+                belief_grid, 
+                motion, 
+                map_info, 
+                config['localization']['motion_diffusion_factor']
+            )
+        else:
+            print("  Skipping prediction step (first frame).")
+
+        # --- Correction Step (Sensor Model) ---
+        belief_grid = correction_step(
+            belief_grid, 
+            sensor_data, 
+            map_info, 
+            likelihood_field, 
+            config
+        )
+
+        # --- Find Best Estimate ---
+        est_grid_y, est_grid_x = np.unravel_index(
+            np.argmax(belief_grid), 
+            belief_grid.shape
+        )
+        est_x_m, est_y_m = grid_to_world(est_grid_x, est_grid_y, map_info)
+        max_prob = np.max(belief_grid)
+        
+        prob_at_gt = 0.0
+        if 0 <= gt_grid_x < map_info.width and 0 <= gt_grid_y < map_info.height:
+             prob_at_gt = belief_grid[gt_grid_y, gt_grid_x]
+
+        # --- 6. Print and Compare ---
+        print("\n  --- Results ---")
+        print(f"  Step Time: {time.time() - start_step_time:.2f}s")
+        print(f"  Ground Truth (World): ({gt_x_m:.2f}m, {gt_y_m:.2f}m)")
+        print(f"  Ground Truth (Grid):  ({gt_grid_x}, {gt_grid_y})")
+        print(f"  Estimated Pos (World): ({est_x_m:.2f}m, {est_y_m:.2f}m)")
+        print(f"  Estimated Pos (Grid):  ({est_grid_x}, {est_grid_y})")
+        print(f"  Highest Belief: {max_prob:.4e}")
+        print(f"  Belief at GT:   {prob_at_gt:.4e}")
+
+        # Update last pose for next iteration
+        last_gt_pose = current_gt_pose
 
 if __name__ == "__main__":
     main()
