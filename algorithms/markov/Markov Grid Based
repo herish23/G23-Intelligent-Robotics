@@ -1,9 +1,25 @@
+"""
+run_grid_localization.py
+
+Main script to run Grid-Based (Markov) Localization using the 
+localization_utils package.
+"""
+
 import numpy as np
 import time
 import csv
 import math
+import sys
+import random 
 
+
+# Add the path to the libraries folder
 sys.path.append("../../libraries")
+# ^^^ This was removed. A simpler way is to put the 'localization_utils' 
+# folder in the SAME directory as this 'run_grid_localization.py' script.
+
+# Import all the utilities from your new package
+try:
     from localization_utils import (
         load_config,
         print_config_summary,
@@ -18,7 +34,7 @@ sys.path.append("../../libraries")
     )
 except ImportError:
     print("Error: Could not import the 'localization_utils' package.")
-    print("Please ensure the 'localization_utils' directory is in the same folder as this script.")
+    print("Please ensure the 'localization_utils' folder is in the SAME directory as this script.")
     exit(1)
 
 
@@ -240,3 +256,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
