@@ -1,0 +1,24 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Data files (optional - uncomment if you don't want to commit data)
+# data/*.csv
+
+# Webots temporary files
+worlds/.*.jpg
+worlds/.*.wbproj
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
