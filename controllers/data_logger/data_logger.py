@@ -1,26 +1,26 @@
-# data logger controller
-# collects sensor data (lidar + odom + ground truth) for offline algo processing
+## automatic data collection from webot based on the trajectory files
+
 
 from controller import Supervisor
 import csv
 import math
 import os
 
-# config
+## config from env vars
 ROBOT_DEF = os.environ.get("ROBOT_DEF", "TB3")
 ROBOT_NAME = os.environ.get("ROBOT_NAME", "TurtleBot3Burger")
-TRAJ_PATH = os.environ.get("TRAJ", "../../maps/traj/traj_debug_square.csv")
+TRAJ_PATH = os.environ.get("TRAJ", "../../maps/traj/traj_balanced_rectangle.csv")
 OUT_DIR = os.environ.get("OUT_DIR", "../../data")
 OUT_FILE = os.environ.get("OUT_FILE", "sensor_data_clean.csv")
-DT_LOG = float(os.environ.get("DT_LOG", "0.02"))
+DT_LOG = float(os.environ.get("DT_LOG", "0.02"))  ## 20ms logging
 
-# robot params
-WHEEL_BASE = 0.160
-WHEEL_RADIUS = 0.033
+WHEEL_BASE = 0.160  # meters between wheels
+WHEEL_RADIUS = 0.033  # wheel radius in meters
 
 
 def yaw_from_axis_angle(ax, ay, az, ang):
-    # axis-angle to yaw conversion
+    ## convert axis-angle rotation to yaw (heading angle)
+    ## webots uses axis-angle, we need yaw for 2d localization
     s = math.sin(ang / 2.0)
     c = math.cos(ang / 2.0)
     qx, qy, qz, qw = ax * s, ay * s, az * s, c
@@ -30,22 +30,26 @@ def yaw_from_axis_angle(ax, ay, az, ang):
 
 
 def load_trajectory(path):
-    # load trajectory csv
+    ## load trajectory csv (timestamp, v, w)
+    traj = []
     with open(path) as f:
         reader = csv.DictReader(f)
-        traj = [(float(r['timestamp']),
-                 float(r['target_linear_velocity']),
-                 float(r['target_angular_velocity'])) for r in reader]
-    traj.sort(key=lambda x: x[0])
+        for r in reader:
+            t = float(r['timestamp'])
+            v = float(r['target_linear_velocity'])
+            w = float(r['target_angular_velocity'])
+            traj.append((t, v, w))
+    traj.sort(key=lambda x: x[0])  ## make sure sorted by time
     return traj
 
 
 def find_robot(sup):
-    # find robot node from the webot 
+    ## find robot node in webots scene tree
     node = sup.getFromDef(ROBOT_DEF)
     if node:
         return node
 
+    ## fallback - search by name if DEF didnt work
     root = sup.getRoot()
     queue = [root]
     while queue:
@@ -55,7 +59,7 @@ def find_robot(sup):
             if name_field and name_field.getSFString() == ROBOT_NAME:
                 return n
         except:
-            pass
+            pass  ## not all nodes have name field
         try:
             children = n.getField("children")
             if children:
@@ -63,164 +67,206 @@ def find_robot(sup):
                     queue.append(children.getMFNode(i))
         except:
             pass
-    return None
+    return None  ## didnt find robot
 
 
 def main():
     sup = Supervisor()
-    timestep = int(sup.getBasicTimeStep())
+    dt = int(sup.getBasicTimeStep())
 
+    ## find robot in scene
     robot_node = find_robot(sup)
     if not robot_node:
-        raise RuntimeError(f"robot not found (DEF='{ROBOT_DEF}', name='{ROBOT_NAME}')")
+        raise RuntimeError(f"cant find robot (DEF='{ROBOT_DEF}', name='{ROBOT_NAME}')")
 
     trans_field = robot_node.getField("translation")
     rot_field = robot_node.getField("rotation")
 
+    ## setup lidar
     lidar = sup.getDevice("LDS-01")
     if not lidar:
-        raise RuntimeError("LDS-01 not found")
-    lidar.enable(timestep)
+        raise RuntimeError("LDS-01 lidar not found")
+    lidar.enable(dt)
     lidar.enablePointCloud()
 
+    ## setup motors (velocity mode)
     left_motor = sup.getDevice("left wheel motor")
     right_motor = sup.getDevice("right wheel motor")
-    left_motor.setPosition(float('inf'))
+    left_motor.setPosition(float('inf'))  ## velocity control mode
     right_motor.setPosition(float('inf'))
     left_motor.setVelocity(0.0)
     right_motor.setVelocity(0.0)
 
-    trajectory = load_trajectory(TRAJ_PATH)
-    t0_traj = trajectory[0][0]
-    t_end = trajectory[-1][0]
+    ## enable wheel encoders for odometry computation
+    left_enc = sup.getDevice("left wheel sensor")
+    right_enc = sup.getDevice("right wheel sensor")
+    left_enc.enable(dt)
+    right_enc.enable(dt)
+
+    ## load trajectory to follow
+    traj = load_trajectory(TRAJ_PATH)
+    t0 = traj[0][0]
+    t_end = traj[-1][0]
     traj_idx = 0
 
-    print(f"loaded trajectory: {len(trajectory)} points, {t_end:.1f}s duration")
+    print(f"loaded trajectory: {len(traj)} waypoints, {t_end:.1f}s duration")
     print(f"logging at dt={DT_LOG}s")
 
+    ## setup csv output
     os.makedirs(OUT_DIR, exist_ok=True)
     out_path = os.path.join(OUT_DIR, OUT_FILE)
     f = open(out_path, 'w', newline='')
     writer = csv.writer(f)
 
-    # csv header logging timestamp, 360 lidar ranges, v, w, ground truth
+    
     header = ['timestamp']
     for i in range(360):
         header.append(f'range_{i}')
-    header.extend(['v', 'w'])
-    header.extend(['gt_x', 'gt_y', 'gt_theta'])
+    header.extend(['odom_x', 'odom_y', 'odom_theta'])  ## odometry from wheel encoders
+    header.extend(['v', 'w'])  ## commanded velocities (for debugging)
+    header.extend(['gt_x', 'gt_y', 'gt_theta'])  ## ground truth from supervisor
     writer.writerow(header)
 
-    next_log_time = 0.0
-    trajectory_done = False
+    next_log_t = 0.0
+    traj_done = False
 
-    # Track expected position based on commanded velocities
-    expected_x, expected_y, expected_theta = trans_field.getSFVec3f()[0], trans_field.getSFVec3f()[1], 0.0
-    last_print_time = 0.0
-    print_interval = 1.0  # Print every 1 second
+    ## init odometry from starting pose
+    pos0 = trans_field.getSFVec3f()
+    ax, ay, az, ang = rot_field.getSFRotation()
+    theta0 = yaw_from_axis_angle(ax, ay, az, ang)
+
+    odom_x = pos0[0]
+    odom_y = pos0[1]
+    odom_theta = theta0
+
+    ## track encoder positions for delta computation
+    prev_left = 0.0
+    prev_right = 0.0
+    first_step = True  ## skip odom update on first iter (no prev encoders yet)
+
+    last_print = 0.0
+    print_interval = 1.0  ## print status every second
 
     print("starting data collection...")
-    print(f"Initial position: ({expected_x:.3f}, {expected_y:.3f})")
-    print(f"{'Time':>6s} | {'Cmd_v':>6s} {'Cmd_w':>6s} | {'Actual_X':>8s} {'Actual_Y':>8s} {'Actual_θ':>7s} | {'Exp_X':>8s} {'Exp_Y':>8s} {'Exp_θ':>7s} | {'ΔPos':>6s}")
+    print(f"start pos: ({odom_x:.3f}, {odom_y:.3f}, {math.degrees(odom_theta):.1f}°)")
+    print(f"{'Time':>6s} | {'Cmd_v':>6s} {'Cmd_w':>6s} | {'GT_X':>8s} {'GT_Y':>8s} {'GT_θ':>7s} | {'Odom_X':>8s} {'Odom_Y':>8s} {'Odom_θ':>7s} | {'Err':>6s}")
 
-    while sup.step(timestep) != -1:
-        sim_time = sup.getTime()
+    while sup.step(dt) != -1:
+        t = sup.getTime()
 
-        if sim_time + 1e-9 < next_log_time:
+        ## only log at specified intervals
+        if t + 1e-9 < next_log_t:
             continue
 
-        t_rel = sim_time + t0_traj
+        t_rel = t + t0
 
-        # advance traj index
-        while traj_idx + 1 < len(trajectory) and trajectory[traj_idx + 1][0] <= t_rel:
+        ## find current trajectory waypoint
+        while traj_idx + 1 < len(traj) and traj[traj_idx + 1][0] <= t_rel:
             traj_idx += 1
 
+        ## get commanded velocities from trajectory
         if t_rel < t_end:
-            _, cmd_v, cmd_w = trajectory[traj_idx]
+            _, cmd_v, cmd_w = traj[traj_idx]
         else:
             cmd_v, cmd_w = 0.0, 0.0
-            if not trajectory_done:
-                print(f"trajectory complete at t={sim_time:.2f}s")
-                trajectory_done = True
+            if not traj_done:
+                print(f"trajectory done at t={t:.2f}s")
+                traj_done = True
 
-        # convert to wheel velocities
+        ## convert differential drive (v,w) to wheel velocities
         vl = (2 * cmd_v - cmd_w * WHEEL_BASE) / (2 * WHEEL_RADIUS)
         vr = (2 * cmd_v + cmd_w * WHEEL_BASE) / (2 * WHEEL_RADIUS)
         left_motor.setVelocity(vl)
         right_motor.setVelocity(vr)
 
+        ## get lidar scan
         ranges = lidar.getRangeImage()
         if len(ranges) != 360:
-            print(f"warning: expected 360 ranges, got {len(ranges)}")
+            print(f"warning: got {len(ranges)} lidar beams instead of 360")
             continue
 
+        ## get ground truth from supervisor
         x, y, z = trans_field.getSFVec3f()
         ax, ay, az, ang = rot_field.getSFRotation()
         gt_theta = yaw_from_axis_angle(ax, ay, az, ang)
 
-        # Update expected position based on commanded velocities (simple integration)
-        dt = timestep / 1000.0
-        if abs(cmd_w) < 1e-6:  # Straight line
-            expected_x += cmd_v * math.cos(expected_theta) * dt
-            expected_y += cmd_v * math.sin(expected_theta) * dt
-        else:  # Arc motion
-            dtheta = cmd_w * dt
-            radius = cmd_v / cmd_w
-            expected_x += radius * (math.sin(expected_theta + dtheta) - math.sin(expected_theta))
-            expected_y += radius * (-math.cos(expected_theta + dtheta) + math.cos(expected_theta))
-            expected_theta += dtheta
-        expected_theta = math.atan2(math.sin(expected_theta), math.cos(expected_theta))
+        ## compute odometry from wheel encoders (differential drive)
+        if not first_step:
+            ## read encoder positions (in radians)
+            left_pos = left_enc.getValue()
+            right_pos = right_enc.getValue()
 
-        # Print comparison every second
-        if sim_time - last_print_time >= print_interval:
-            pos_error = math.sqrt((x - expected_x)**2 + (y - expected_y)**2)
-            theta_error_deg = math.degrees(abs(gt_theta - expected_theta))
-            if theta_error_deg > 180:
-                theta_error_deg = 360 - theta_error_deg
-            print(f"{sim_time:6.2f} | {cmd_v:6.2f} {cmd_w:6.2f} | {x:8.3f} {y:8.3f} {math.degrees(gt_theta):7.1f} | {expected_x:8.3f} {expected_y:8.3f} {math.degrees(expected_theta):7.1f} | {pos_error*100:6.1f}cm")
-            last_print_time = sim_time
+            ## compute wheel arc lengths since last step
+            dl = (left_pos - prev_left) * WHEEL_RADIUS  ## meters
+            dr = (right_pos - prev_right) * WHEEL_RADIUS
 
-        # write csv row
-        row = [f"{sim_time:.3f}"]
+            ## differential drive kinematics
+            ds = (dr + dl) / 2.0  ## linear displacement
+            dtheta = (dr - dl) / WHEEL_BASE  ## angular displacement
+
+            ## integrate motion into odometry pose
+            odom_x += ds * math.cos(odom_theta + dtheta / 2.0)
+            odom_y += ds * math.sin(odom_theta + dtheta / 2.0)
+            odom_theta += dtheta
+            odom_theta = math.atan2(math.sin(odom_theta), math.cos(odom_theta))  ## wrap to [-pi,pi]
+
+            ## save for next step
+            prev_left = left_pos
+            prev_right = right_pos
+        else:
+            ## first timestep - just init encoders
+            prev_left = left_enc.getValue()
+            prev_right = right_enc.getValue()
+            first_step = False
+
+        ## print status every second
+        if t - last_print >= print_interval:
+            odom_err = math.sqrt((x - odom_x)**2 + (y - odom_y)**2)
+            print(f"{t:6.2f} | {cmd_v:6.2f} {cmd_w:6.2f} | {x:8.3f} {y:8.3f} {math.degrees(gt_theta):7.1f} | {odom_x:8.3f} {odom_y:8.3f} {math.degrees(odom_theta):7.1f} | {odom_err*100:5.1f}cm")
+            last_print = t
+
+        ## write csv row
+        row = [f"{t:.3f}"]
         for r in ranges:
             row.append(f"{r:.6f}")
+        row.append(f"{odom_x:.6f}")
+        row.append(f"{odom_y:.6f}")
+        row.append(f"{odom_theta:.6f}")
         row.append(f"{cmd_v:.6f}")
         row.append(f"{cmd_w:.6f}")
         row.append(f"{x:.6f}")
         row.append(f"{y:.6f}")
         row.append(f"{gt_theta:.6f}")
-
         writer.writerow(row)
 
-        next_log_time += DT_LOG
+        next_log_t += DT_LOG
 
-        if trajectory_done and sim_time > t_end + 1.0:
+        if traj_done and t > t_end + 1.0:
             break
 
     f.close()
     left_motor.setVelocity(0.0)
     right_motor.setVelocity(0.0)
 
-    # Final position comparison
+    ## final odometry drift check
     x, y, z = trans_field.getSFVec3f()
     ax, ay, az, ang = rot_field.getSFRotation()
     gt_theta = yaw_from_axis_angle(ax, ay, az, ang)
-    final_pos_error = math.sqrt((x - expected_x)**2 + (y - expected_y)**2)
-    final_theta_error = math.degrees(abs(gt_theta - expected_theta))
-    if final_theta_error > 180:
-        final_theta_error = 360 - final_theta_error
+    final_err = math.sqrt((x - odom_x)**2 + (y - odom_y)**2)
+    theta_err = math.degrees(abs(gt_theta - odom_theta))
+    if theta_err > 180:
+        theta_err = 360 - theta_err
 
-    print("\n" + "="*70)
-    print("TRAJECTORY TRACKING SUMMARY")
-    print("="*70)
-    print(f"Final Actual Position:   ({x:.3f}, {y:.3f}, {math.degrees(gt_theta):.1f}°)")
-    print(f"Final Expected Position: ({expected_x:.3f}, {expected_y:.3f}, {math.degrees(expected_theta):.1f}°)")
-    print(f"Position Error:  {final_pos_error*100:.1f} cm")
-    print(f"Heading Error:   {final_theta_error:.1f}°")
-    print("="*70)
+    print("\n" + "="*60)
+    print("odometry drift summary")
+    print("="*60)
+    print(f"ground truth: ({x:.3f}, {y:.3f}, {math.degrees(gt_theta):.1f}°)")
+    print(f"odometry:     ({odom_x:.3f}, {odom_y:.3f}, {math.degrees(odom_theta):.1f}°)")
+    print(f"drift: {final_err*100:.1f}cm position, {theta_err:.1f}° heading")
+    print("="*60)
 
-    print("\ndata collection complete!")
-    print(f"saved to: {os.path.abspath(out_path)}")
+    print("\ndata collection done!")
+    print(f"saved: {os.path.abspath(out_path)}")
 
 
 if __name__ == "__main__":
