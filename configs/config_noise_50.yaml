@@ -1,24 +1,23 @@
-# Noise Level: 50% increased sensor noise
+## noise level: 50% outlier rate
+## test robustness by replacing 50% of sensor readings with random measurements
 
 experiment:
   name: "noise_50"
-  description: "50% increased sensor noise over baseline"
+  description: "50% sensor noise robustness test"
 
 data:
   sensor_log: "data/sensor_data_clean.csv"
 
-robot:
-  initial_pose: [0.0, 0.0, 0.0]
-
 sensors:
   lidar:
     device_name: "LDS-01"
-    noise_std: 0.030           # 50% increase: 0.02 * 1.5 = 0.030
+    noise_std: 0.02            ## gaussian noise on range measurements
+    outlier_rate: 0.50         ## 50% of readings replaced with random values
     max_range: 3.5
-    sparsity: 1
+    sparsity: 1                ## use all data points (no sparsity)
 
   odometry:
-    alphas: [0.15, 0.15, 0.15, 0.15]  # 50% increase
+    noise_std: 0.01            ## gaussian noise on velocity commands
 
 random_seed: 42
 output_dir: "results"
