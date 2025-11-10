@@ -8,26 +8,37 @@ from datetime import datetime
 sys.path.append("../../libraries")
 from localization_utils import load_sensor_data, load_map, compute_likelihood_field
 
-from amcl import initialize_particles, motion_update, sensor_update, normalize_weights, kld_resample, get_mean_pose
+## import from amcl but override KLD params
+import amcl
+from amcl import initialize_particles, motion_update, normalize_weights, get_mean_pose
+
 sensor_data = load_sensor_data('../../data/sensor_data_clean.csv')
 map_info = load_map('../../maps/epuck_world_map.pgm', '../../maps/epuck_world_map.yaml')
 likelihood_field = compute_likelihood_field(map_info, max_dist=2.0)
 
-print("="*60)
-print("BASELINE CALIBRATION - NEW DATASET (5.79m trajectory)")
-print("="*60)
-print(f"Timesteps: {len(sensor_data['timestamps'])}")
-print(f"Duration: {sensor_data['timestamps'][-1]:.1f}s")
-print(f"Data rate: 50Hz")
-print("="*60)
+## SENSOR CONFIG LOCKED from previous calibration
+OPTIMAL_BEAMS = 90  # winner from sensor calibration
+OPTIMAL_SIGMA = 0.2
 
+## BASELINE REFERENCES
+BASELINE_ERROR = 0.541  # 60 beams, n_min=100 baseline
+SENSOR_BEST_ERROR = 0.440  # 90 beams, n_min=100 (current best)
 
-## Baseline test - Reis 2020 starting point (500 particles)
-## NEW DATASET: pose tracking mode, proper odometry, 5Hz updates
-UPDATE_SKIP = 10  # 5Hz update rate (50Hz / 10)
+print("="*60)
+print("KLD SAMPLING CALIBRATION - NEW DATASET")
 
-def test_baseline(run_num):
-    ## pose tracking - start from known initial pose
+## CONFIG TO TEST - change this!
+TEST_N_MIN = 1000  # <<< CHANGE: 500, 750, 1000, 1500
+
+UPDATE_SKIP = 10  # 5Hz updates
+
+def test_kld_config(run_num, n_min):
+    ## override amcl params
+    amcl.num_beams = OPTIMAL_BEAMS
+    amcl.sigma_hit = OPTIMAL_SIGMA
+    amcl.n_min = n_min
+
+    ## pose tracking mode
     init_pose = tuple(sensor_data['ground_truth'][0])
     uncertainty = (0.3, 0.3, 0.5)
     particles = initialize_particles(500, map_info, init_pose, uncertainty)
@@ -35,42 +46,36 @@ def test_baseline(run_num):
     n_steps = len(sensor_data['timestamps'])
     timestamps = sensor_data['timestamps']
     results = []
-
-    ## timing metrics for paper
     update_times = []
 
     print(f"\n=== RUN {run_num}/3 ===")
-    print(f"Init: ({init_pose[0]:.2f}, {init_pose[1]:.2f})")
-    print(f"Updates: every {UPDATE_SKIP} steps = 5Hz")
+    print(f"n_min: {n_min}, beams: {OPTIMAL_BEAMS}")
 
     prev_t = 0
 
     for t in range(UPDATE_SKIP, n_steps, UPDATE_SKIP):
         start_time = time.time()
 
-        ## USE ODOMETRY not ground truth!
+        ## USE ODOMETRY
         prev_odom = sensor_data['odometry'][prev_t]
         curr_odom = sensor_data['odometry'][t]
 
-        # motion update
         motion_update(particles, prev_odom, curr_odom)
 
-        # sensor update
+        ## sensor update
         lidar = sensor_data['lidar_scans'][t]
-        sensor_update(particles, lidar, likelihood_field, map_info)
+        amcl.sensor_update(particles, lidar, likelihood_field, map_info)
         normalize_weights(particles)
 
-        # resample
-        particles = kld_resample(particles, map_info)
+        ## KLD resample with current n_min
+        particles = amcl.kld_resample(particles, map_info)
 
-        # estimate
         est_x, est_y, est_theta = get_mean_pose(particles)
         gt = sensor_data['ground_truth'][t]
 
-        # error
         err = np.sqrt((est_x - gt[0])**2 + (est_y - gt[1])**2)
 
-        update_time = (time.time() - start_time) * 1000  # ms
+        update_time = (time.time() - start_time) * 1000
         update_times.append(update_time)
 
         results.append({
@@ -91,26 +96,26 @@ def test_baseline(run_num):
 
         prev_t = t
 
-    # save this run to csv
-    with open(f'results/baseline_run{run_num}.csv', 'w', newline='') as f:
+    ## save detailed results
+    with open(f'results/kld_nmin{n_min}_run{run_num}.csv', 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['timestamp', 'x_est', 'y_est', 'theta_est','x_gt', 'y_gt', 'theta_gt','error', 'n_particles', 'update_time_ms'])
         writer.writeheader()
         writer.writerows(results)
 
-    ## enhanced analysis for paper
+    ## analysis
     errors = [r['error'] for r in results]
     mean_err = np.mean(errors)
+    median_err = np.median(errors)
     std_err = np.std(errors)
     min_err = np.min(errors)
     max_err = np.max(errors)
-    median_err = np.median(errors)
 
-    ## convergence analysis - when does error stabilize?
+    ## convergence
     convergence_idx = 0
     window_size = 10
     for i in range(window_size, len(errors)):
         window_std = np.std(errors[i-window_size:i])
-        if window_std < 0.1:  # stable when std < 10cm
+        if window_std < 0.1:
             convergence_idx = i
             break
     convergence_time = results[convergence_idx]['timestamp'] if convergence_idx > 0 else 0
@@ -119,7 +124,6 @@ def test_baseline(run_num):
     mean_particles = np.mean(particles_count)
     std_particles = np.std(particles_count)
 
-    ## computational performance
     mean_update_time = np.mean(update_times)
     max_update_time = np.max(update_times)
 
@@ -141,43 +145,47 @@ def test_baseline(run_num):
     }
 
 
-## run the test 3 times
+## run test 3 times with current n_min
 all_runs = []
 for run in range(1, 4):
-    run_results = test_baseline(run)
+    run_results = test_kld_config(run, TEST_N_MIN)
     all_runs.append(run_results)
 
-# summary
+## summary
 print("\n" + "="*60)
-print("BASELINE RESULTS (NEW DATASET)")
+print(f"KLD TEST RESULTS (n_min={TEST_N_MIN}, {OPTIMAL_BEAMS} beams)")
 print("="*60)
 for i, r in enumerate(all_runs, 1):
     print(f"Run {i}: {r['mean']:.3f}m (median={r['median']:.3f}m, std={r['std']:.3f}m)")
 
-## aggregate metrics across 3 runs
+## aggregate
 avg_mean = np.mean([r['mean'] for r in all_runs])
 avg_median = np.mean([r['median'] for r in all_runs])
 avg_std = np.mean([r['std'] for r in all_runs])
-consistency = np.std([r['mean'] for r in all_runs])  # how consistent across runs
+consistency = np.std([r['mean'] for r in all_runs])
 
 print(f"\nAverage across runs: {avg_mean:.3f}m")
 print(f"Median across runs:  {avg_median:.3f}m")
-print(f"Run consistency:     {consistency:.3f}m (std of means)")
+print(f"Run consistency:     {consistency:.3f}m")
 print(f"Avg convergence:     {np.mean([r['convergence_time'] for r in all_runs]):.1f}s")
 print(f"Avg particles:       {np.mean([r['particles_mean'] for r in all_runs]):.0f}")
 print(f"Avg update time:     {np.mean([r['update_time_mean'] for r in all_runs]):.1f}ms")
+
+## improvement vs sensor-optimized config
+improvement = ((SENSOR_BEST_ERROR - avg_mean) / SENSOR_BEST_ERROR) * 100
+print(f"\nSensor optimized (n_min=100): {SENSOR_BEST_ERROR:.3f}m")
+print(f"This test (n_min={TEST_N_MIN}):      {avg_mean:.3f}m")
+print(f"Improvement: {improvement:+.1f}%")
 print("="*60)
 
-## enhanced log entry for paper analysis
+## enhanced log
 log_entry = {
-    'test_name': 'baseline_NEW_DATASET',
+    'test_name': f'kld_nmin{TEST_N_MIN}_NEW',
     'date': datetime.now().strftime('%Y-%m-%d %H:%M'),
     'dataset_info': {
         'trajectory_length': '5.79m',
         'duration': f"{sensor_data['timestamps'][-1]:.1f}s",
-        'timesteps_total': len(sensor_data['timestamps']),
-        'update_frequency': '5Hz',
-        'updates_performed': all_runs[0]['num_updates']
+        'update_frequency': '5Hz'
     },
     'params': {
         'n_particles': 500,
@@ -187,9 +195,9 @@ log_entry = {
         'alpha4': 0.02,
         'z_hit': 0.95,
         'z_rand': 0.05,
-        'sigma_hit': 0.2,
-        'num_beams': 60,
-        'n_min': 100,
+        'sigma_hit': OPTIMAL_SIGMA,
+        'num_beams': OPTIMAL_BEAMS,
+        'n_min': TEST_N_MIN,
         'n_max': 5000,
         'epsilon': 0.05,
         'bin_size': 0.5
@@ -212,23 +220,19 @@ log_entry = {
         'avg_update_time_ms': round(np.mean([r['update_time_mean'] for r in all_runs]), 2),
         'max_update_time_ms': round(np.max([r['update_time_max'] for r in all_runs]), 2)
     },
-    'improvement_vs_baseline': 0.0,
-    'notes': 'Reis 2020 baseline (500 particles) on NEW 5.79m dataset. Pose tracking mode. Proper odometry (20cm drift). Reference for systematic calibration.'
+    'improvement_vs_baseline': round(((BASELINE_ERROR - avg_mean) / BASELINE_ERROR) * 100, 1),
+    'improvement_vs_sensor_opt': round(improvement, 1),
+    'notes': f'KLD calibration: n_min={TEST_N_MIN} with optimal sensor (90 beams). Reis 2019 systematic n_min testing for stability vs speed.'
 }
 
-# read existing log (KEEP ALL OLD ENTRIES!)
+## read existing log (keep all old entries!)
 try:
     with open('calibration_log.json', 'r') as f:
         log = json.load(f)
 except:
     log = []
 
-# add new entry
 log.append(log_entry)
 
-# save back
 with open('calibration_log.json', 'w') as f:
     json.dump(log, f, indent=2)
-
-print("\n✓ Logged to calibration_log.json (old entries preserved)")
-print(f"✓ Detailed results saved to results/baseline_run1-3.csv")

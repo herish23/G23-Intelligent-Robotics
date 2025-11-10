@@ -8,26 +8,36 @@ from datetime import datetime
 sys.path.append("../../libraries")
 from localization_utils import load_sensor_data, load_map, compute_likelihood_field
 
-from amcl import initialize_particles, motion_update, sensor_update, normalize_weights, kld_resample, get_mean_pose
+## import from amcl but override sensor params
+import amcl
+from amcl import initialize_particles, motion_update, normalize_weights, kld_resample, get_mean_pose
+
 sensor_data = load_sensor_data('../../data/sensor_data_clean.csv')
 map_info = load_map('../../maps/epuck_world_map.pgm', '../../maps/epuck_world_map.yaml')
 likelihood_field = compute_likelihood_field(map_info, max_dist=2.0)
 
+## BASELINE REFERENCE from previous test
+BASELINE_ERROR = 0.541  # from baseline_NEW_DATASET
+
 print("="*60)
-print("BASELINE CALIBRATION - NEW DATASET (5.79m trajectory)")
+print("SENSOR MODEL CALIBRATION - NEW DATASET")
 print("="*60)
-print(f"Timesteps: {len(sensor_data['timestamps'])}")
-print(f"Duration: {sensor_data['timestamps'][-1]:.1f}s")
-print(f"Data rate: 50Hz")
+print(f"Baseline reference: {BASELINE_ERROR:.3f}m (60 beams, sigma=0.2)")
+print(f"Testing: num_beams and sigma_hit")
 print("="*60)
 
+## CONFIG TO TEST - change these!
+TEST_NUM_BEAMS = 180  # <<< CHANGE: 90, 120, 180
+TEST_SIGMA_HIT = 0.2  # <<< CHANGE: 0.2, 0.15, 0.1
 
-## Baseline test - Reis 2020 starting point (500 particles)
-## NEW DATASET: pose tracking mode, proper odometry, 5Hz updates
-UPDATE_SKIP = 10  # 5Hz update rate (50Hz / 10)
+UPDATE_SKIP = 10  # 5Hz updates
 
-def test_baseline(run_num):
-    ## pose tracking - start from known initial pose
+def test_sensor_config(run_num, num_beams, sigma_hit):
+    ## temporarily override amcl sensor params
+    amcl.num_beams = num_beams
+    amcl.sigma_hit = sigma_hit
+
+    ## pose tracking mode
     init_pose = tuple(sensor_data['ground_truth'][0])
     uncertainty = (0.3, 0.3, 0.5)
     particles = initialize_particles(500, map_info, init_pose, uncertainty)
@@ -35,42 +45,35 @@ def test_baseline(run_num):
     n_steps = len(sensor_data['timestamps'])
     timestamps = sensor_data['timestamps']
     results = []
-
-    ## timing metrics for paper
     update_times = []
 
     print(f"\n=== RUN {run_num}/3 ===")
-    print(f"Init: ({init_pose[0]:.2f}, {init_pose[1]:.2f})")
-    print(f"Updates: every {UPDATE_SKIP} steps = 5Hz")
+    print(f"Beams: {num_beams}, Sigma: {sigma_hit}")
 
     prev_t = 0
 
     for t in range(UPDATE_SKIP, n_steps, UPDATE_SKIP):
         start_time = time.time()
 
-        ## USE ODOMETRY not ground truth!
+        ## USE ODOMETRY
         prev_odom = sensor_data['odometry'][prev_t]
         curr_odom = sensor_data['odometry'][t]
 
-        # motion update
         motion_update(particles, prev_odom, curr_odom)
 
-        # sensor update
+        ## sensor update with current config
         lidar = sensor_data['lidar_scans'][t]
-        sensor_update(particles, lidar, likelihood_field, map_info)
+        amcl.sensor_update(particles, lidar, likelihood_field, map_info)
         normalize_weights(particles)
 
-        # resample
         particles = kld_resample(particles, map_info)
 
-        # estimate
         est_x, est_y, est_theta = get_mean_pose(particles)
         gt = sensor_data['ground_truth'][t]
 
-        # error
         err = np.sqrt((est_x - gt[0])**2 + (est_y - gt[1])**2)
 
-        update_time = (time.time() - start_time) * 1000  # ms
+        update_time = (time.time() - start_time) * 1000
         update_times.append(update_time)
 
         results.append({
@@ -91,26 +94,26 @@ def test_baseline(run_num):
 
         prev_t = t
 
-    # save this run to csv
-    with open(f'results/baseline_run{run_num}.csv', 'w', newline='') as f:
+    ## save detailed results
+    with open(f'results/sensor_b{num_beams}_s{sigma_hit}_run{run_num}.csv', 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['timestamp', 'x_est', 'y_est', 'theta_est','x_gt', 'y_gt', 'theta_gt','error', 'n_particles', 'update_time_ms'])
         writer.writeheader()
         writer.writerows(results)
 
-    ## enhanced analysis for paper
+    ## analysis
     errors = [r['error'] for r in results]
     mean_err = np.mean(errors)
+    median_err = np.median(errors)
     std_err = np.std(errors)
     min_err = np.min(errors)
     max_err = np.max(errors)
-    median_err = np.median(errors)
 
-    ## convergence analysis - when does error stabilize?
+    ## convergence
     convergence_idx = 0
     window_size = 10
     for i in range(window_size, len(errors)):
         window_std = np.std(errors[i-window_size:i])
-        if window_std < 0.1:  # stable when std < 10cm
+        if window_std < 0.1:
             convergence_idx = i
             break
     convergence_time = results[convergence_idx]['timestamp'] if convergence_idx > 0 else 0
@@ -119,7 +122,6 @@ def test_baseline(run_num):
     mean_particles = np.mean(particles_count)
     std_particles = np.std(particles_count)
 
-    ## computational performance
     mean_update_time = np.mean(update_times)
     max_update_time = np.max(update_times)
 
@@ -141,43 +143,47 @@ def test_baseline(run_num):
     }
 
 
-## run the test 3 times
+## run test 3 times with current config
 all_runs = []
 for run in range(1, 4):
-    run_results = test_baseline(run)
+    run_results = test_sensor_config(run, TEST_NUM_BEAMS, TEST_SIGMA_HIT)
     all_runs.append(run_results)
 
-# summary
+## summary
 print("\n" + "="*60)
-print("BASELINE RESULTS (NEW DATASET)")
+print(f"SENSOR TEST RESULTS (beams={TEST_NUM_BEAMS}, sigma={TEST_SIGMA_HIT})")
 print("="*60)
 for i, r in enumerate(all_runs, 1):
     print(f"Run {i}: {r['mean']:.3f}m (median={r['median']:.3f}m, std={r['std']:.3f}m)")
 
-## aggregate metrics across 3 runs
+## aggregate
 avg_mean = np.mean([r['mean'] for r in all_runs])
 avg_median = np.mean([r['median'] for r in all_runs])
 avg_std = np.mean([r['std'] for r in all_runs])
-consistency = np.std([r['mean'] for r in all_runs])  # how consistent across runs
+consistency = np.std([r['mean'] for r in all_runs])
 
 print(f"\nAverage across runs: {avg_mean:.3f}m")
 print(f"Median across runs:  {avg_median:.3f}m")
-print(f"Run consistency:     {consistency:.3f}m (std of means)")
+print(f"Run consistency:     {consistency:.3f}m")
 print(f"Avg convergence:     {np.mean([r['convergence_time'] for r in all_runs]):.1f}s")
 print(f"Avg particles:       {np.mean([r['particles_mean'] for r in all_runs]):.0f}")
 print(f"Avg update time:     {np.mean([r['update_time_mean'] for r in all_runs]):.1f}ms")
+
+## improvement vs baseline
+improvement = ((BASELINE_ERROR - avg_mean) / BASELINE_ERROR) * 100
+print(f"\nBaseline: {BASELINE_ERROR:.3f}m")
+print(f"This test: {avg_mean:.3f}m")
+print(f"Improvement: {improvement:+.1f}%")
 print("="*60)
 
-## enhanced log entry for paper analysis
+## enhanced log
 log_entry = {
-    'test_name': 'baseline_NEW_DATASET',
+    'test_name': f'sensor_b{TEST_NUM_BEAMS}_s{TEST_SIGMA_HIT}_NEW',
     'date': datetime.now().strftime('%Y-%m-%d %H:%M'),
     'dataset_info': {
         'trajectory_length': '5.79m',
         'duration': f"{sensor_data['timestamps'][-1]:.1f}s",
-        'timesteps_total': len(sensor_data['timestamps']),
-        'update_frequency': '5Hz',
-        'updates_performed': all_runs[0]['num_updates']
+        'update_frequency': '5Hz'
     },
     'params': {
         'n_particles': 500,
@@ -187,12 +193,11 @@ log_entry = {
         'alpha4': 0.02,
         'z_hit': 0.95,
         'z_rand': 0.05,
-        'sigma_hit': 0.2,
-        'num_beams': 60,
+        'sigma_hit': TEST_SIGMA_HIT,
+        'num_beams': TEST_NUM_BEAMS,
         'n_min': 100,
         'n_max': 5000,
-        'epsilon': 0.05,
-        'bin_size': 0.5
+        'epsilon': 0.05
     },
     'results': {
         'run1_mean': round(all_runs[0]['mean'], 3),
@@ -212,23 +217,19 @@ log_entry = {
         'avg_update_time_ms': round(np.mean([r['update_time_mean'] for r in all_runs]), 2),
         'max_update_time_ms': round(np.max([r['update_time_max'] for r in all_runs]), 2)
     },
-    'improvement_vs_baseline': 0.0,
-    'notes': 'Reis 2020 baseline (500 particles) on NEW 5.79m dataset. Pose tracking mode. Proper odometry (20cm drift). Reference for systematic calibration.'
+    'improvement_vs_baseline': round(improvement, 1),
+    'notes': f'Sensor calibration: {TEST_NUM_BEAMS} beams, sigma={TEST_SIGMA_HIT}. Testing systematic impact of sensor model on NEW dataset.'
 }
 
-# read existing log (KEEP ALL OLD ENTRIES!)
+## read existing log (keep all old entries!)
 try:
     with open('calibration_log.json', 'r') as f:
         log = json.load(f)
 except:
     log = []
 
-# add new entry
 log.append(log_entry)
 
-# save back
 with open('calibration_log.json', 'w') as f:
     json.dump(log, f, indent=2)
 
-print("\n✓ Logged to calibration_log.json (old entries preserved)")
-print(f"✓ Detailed results saved to results/baseline_run1-3.csv")
