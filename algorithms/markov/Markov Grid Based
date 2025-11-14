@@ -31,9 +31,59 @@ except ImportError:
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
+"""
+run_localization_gpu.py
+
+Main script to run Grid-Based (Markov) Localization, accelerated with CUDA/GPU.
+
+** This version is now FULLY SELF-CONTAINED and uses CuPy for GPU acceleration. **
+It requires an NVIDIA GPU, the CUDA Toolkit, and the 'cupy' library.
+
+**Changelog:**
+- Added 'GPU_ENABLED' flag to create a robust CPU-fallback mode.
+- Fixed 'AttributeError' crash when CuPy is not found.
+- Added 'scipy' as a standard import.
+"""
+
+import numpy as np
+import time
+import csv
+import math
+import sys
+import random 
+import os 
+import yaml 
+from PIL import Image 
+from dataclasses import dataclass 
+from scipy.ndimage import distance_transform_edt as cpu_distance_transform_edt
+import scipy
+
+# --- Try to import GPU libraries ---
+try:
+    import cupy as cp
+    from cupyx.scipy.ndimage import distance_transform_edt as gpu_distance_transform_edt
+    GPU_ENABLED = True
+    print("Successfully imported CuPy. GPU acceleration is ENABLED.")
+except ImportError:
+    GPU_ENABLED = False
+    print("="*70)
+    print("Warning: Could not import 'cupy' or 'cupyx.scipy'.")
+    print("GPU acceleration will be DISABLED. Script will run on CPU.")
+    print("Please ensure you have an NVIDIA GPU, the CUDA Toolkit, and 'cupy' installed.")
+    print("  (e.g., 'pip install cupy-cuda12x scipy')")
+    print("="*70)
+    # Fallback to CPU-only
+    cp = np # Use numpy as a substitute
+    # We create a simple wrapper to make the CPU function look like the GPU one
+    def gpu_distance_transform_edt(arr):
+        return cpu_distance_transform_edt(arr)
+
+
+# -----------------------------------------------------------------------------
+# CONFIGURATION
 # -----------------------------------------------------------------------------
 # All settings are in this dictionary. Update the paths to match your system.
-# *** IMPORTANT: All 3 paths MUST be FULL, ABSOLUTE paths ***
+# *** IMPORTANT: All 3 paths MUST be FULL, ABS_OLUTE paths ***
 # -----------------------------------------------------------------------------
 CONFIG = {
     'data': {
@@ -107,11 +157,11 @@ def load_map(pgm_path, yaml_path):
     h, w = occ_grid_cpu.shape
     
     # --- GPU CHANGE ---
-    # Move the final occupancy grid to the GPU
+    # Move the final occupancy grid to the GPU (or keep as numpy if disabled)
     occ_grid_gpu = cp.asarray(occ_grid_cpu)
 
     return MapInfo(
-        occupancy_grid=occ_grid_gpu, # Store the GPU array
+        occupancy_grid=occ_grid_gpu, # Store the GPU/CPU array
         resolution=res,
         origin_x=ox,
         origin_y=oy,
@@ -196,10 +246,10 @@ def grid_to_world(grid_x, grid_y, map_info):
     return x, y
 
 def compute_likelihood_field(map_info, sigma=0.1, max_dist=2.0):
-    """ precompute likelihood field for sensor model - GPU """
+    """ precompute likelihood field for sensor model - GPU/CPU """
     
     # --- GPU CHANGE ---
-    # map_info.occupancy_grid is already on the GPU
+    # map_info.occupancy_grid is already on the GPU (or is numpy)
     obs = (map_info.occupancy_grid > 0.5).astype(cp.float32)
 
     # distance transform - euclidean dist to nearest obstacle
@@ -246,19 +296,21 @@ def compute_scan_likelihood_field(scan_ranges_gpu, scan_angles_gpu, robot_x, rob
     px_gpu = robot_x_gpu + scan_ranges_gpu * cp.cos(global_angles)
     py_gpu = robot_y_gpu + scan_ranges_gpu * cp.sin(global_angles)
 
-    # --- GPU CHANGE ---
-    # This part is tricky. We need to convert world to grid.
-    # We'll do this on the CPU for simplicity, as it requires integer casting and indexing.
+    # --- GPU/CPU CHANGE ---
     # This is a bottleneck: moving data back from GPU to CPU.
-    px_cpu = px_gpu.get()
-    py_cpu = py_gpu.get()
-    
-    # --- GPU CHANGE ---
-    # Move likelihood field to CPU for indexing
-    # This is also a bottleneck!
-    likelihood_field_cpu = likelihood_field_gpu.get()
+    # If GPU is disabled, this is a simple numpy array copy.
+    if GPU_ENABLED:
+        px_cpu = px_gpu.get()
+        py_cpu = py_gpu.get()
+        scan_ranges_cpu = scan_ranges_gpu.get()
+        likelihood_field_cpu = likelihood_field_gpu.get()
+    else:
+        px_cpu = px_gpu # It's already a numpy array
+        py_cpu = py_gpu
+        scan_ranges_cpu = scan_ranges_gpu
+        likelihood_field_cpu = likelihood_field_gpu
 
-    for r, px, py in zip(scan_ranges_gpu.get(), px_cpu, py_cpu):
+    for r, px, py in zip(scan_ranges_cpu, px_cpu, py_cpu):
         # Skip invalid ranges
         if r < 0.12 or r > 3.5:
             continue
@@ -289,7 +341,7 @@ def compute_scan_likelihood_field(scan_ranges_gpu, scan_angles_gpu, robot_x, rob
 def prediction_step(belief_grid_gpu, motion, map_info, diffusion_factor):
     """
     Updates the belief grid based on a motion model P(x_t | u_t, x_t-1).
-    'motion' is (dx_m, dy_m). Runs on GPU.
+    'motion' is (dx_m, dy_m). Runs on GPU/CPU.
     """
     dx_m, dy_m = motion
     
@@ -317,7 +369,7 @@ def prediction_step(belief_grid_gpu, motion, map_info, diffusion_factor):
                    (uniform_prob * diffusion_factor)
     
     # Mask out any probabilities in occupied cells
-    # map_info.occupancy_grid is already on GPU
+    # map_info.occupancy_grid is already on GPU/CPU
     final_belief[map_info.occupancy_grid > 0.5] = 0.0
 
     # Normalize the belief
@@ -334,16 +386,16 @@ def prediction_step(belief_grid_gpu, motion, map_info, diffusion_factor):
 def correction_step(belief_grid_gpu, sensor_data, map_info, likelihood_field_gpu, config, verbose=False):
     """
     Updates the belief grid based on the sensor model P(z_t | x_t)
-    using the pre-computed likelihood field. Runs on GPU.
+    using the pre-computed likelihood field. Runs on GPU/CPU.
     """
     
     lidar_config = config['sensors']['lidar']
     
     # --- GPU CHANGE ---
-    # Move sensor data to GPU
+    # Move sensor data to GPU (or keep as numpy if disabled)
     lidar_ranges_gpu = cp.asarray(sensor_data['ranges'])
     
-    # Create an array of lidar angles (on GPU)
+    # Create an array of lidar angles (on GPU/CPU)
     angles_gpu = cp.linspace(
         -math.radians(lidar_config['fov_deg']) / 2.0,
         math.radians(lidar_config['fov_deg']) / 2.0,
@@ -364,13 +416,19 @@ def correction_step(belief_grid_gpu, sensor_data, map_info, likelihood_field_gpu
     if verbose:
         print("  Running correction step (using likelihood field)...")
     
-    # Create grid of all possible cell coordinates (on GPU)
+    # Create grid of all possible cell coordinates (on GPU/CPU)
     y_coords, x_coords = cp.indices(belief_grid_gpu.shape)
     
+    # --- GPU/CPU BUG FIX ---
     # Convert all grid coords to world coords (on CPU)
     # This is a bottleneck!
-    x_coords_cpu = x_coords.get()
-    y_coords_cpu = y_coords.get()
+    if GPU_ENABLED:
+        x_coords_cpu = x_coords.get()
+        y_coords_cpu = y_coords.get()
+    else:
+        x_coords_cpu = x_coords # It's already a numpy array
+        y_coords_cpu = y_coords
+        
     wx_cpu, wy_cpu = grid_to_world(x_coords_cpu, y_coords_cpu, map_info)
     
     # Move world coords back to GPU
@@ -391,7 +449,16 @@ def correction_step(belief_grid_gpu, sensor_data, map_info, likelihood_field_gpu
     # Calculate log-likelihood for all valid cells
     # This loop is the main bottleneck.
     log_p_values = []
-    for wx_cell, wy_cell in zip(valid_wx.get(), valid_wy.get()): # .get() to iterate on CPU
+    
+    # --- GPU/CPU BUG FIX ---
+    if GPU_ENABLED:
+        valid_wx_cpu = valid_wx.get()
+        valid_wy_cpu = valid_wy.get()
+    else:
+        valid_wx_cpu = valid_wx
+        valid_wy_cpu = valid_wy
+        
+    for wx_cell, wy_cell in zip(valid_wx_cpu, valid_wy_cpu): # .get() to iterate on CPU
         log_p = compute_scan_likelihood_field(
             sparse_ranges_gpu, sparse_angles_gpu, 
             wx_cell, wy_cell, gt_theta_rad,
@@ -467,7 +534,7 @@ def main():
     
     # --- 3. Initialize Belief ---
     print("Initializing belief grid...")
-    # P(x_0) = Uniform distribution (on GPU)
+    # P(x_0) = Uniform distribution (on GPU/CPU)
     belief_grid_gpu = cp.ones((map_info.height, map_info.width))
     # Remove belief from occupied cells
     belief_grid_gpu[map_info.occupancy_grid > 0.5] = 0.0
@@ -535,9 +602,12 @@ def main():
         )
 
         # --- Find Best Estimate & Print ---
-        # --- GPU CHANGE ---
-        # Move data back to CPU for argmax and printing
-        belief_grid_cpu = belief_grid_gpu.get()
+        # --- GPU/CPU BUG FIX ---
+        # Move data back to CPU for argmax and printing (if it was on GPU)
+        if GPU_ENABLED:
+            belief_grid_cpu = belief_grid_gpu.get()
+        else:
+            belief_grid_cpu = belief_grid_gpu # It's already a numpy array
         
         est_grid_y, est_grid_x = np.unravel_index(
             np.argmax(belief_grid_cpu), 
