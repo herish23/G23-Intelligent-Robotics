@@ -12,6 +12,7 @@ It requires an NVIDIA GPU, the CUDA Toolkit, and the 'cupy' library.
 - Added 'scipy' as a standard import.
 - Added final average error calculation.
 - Fixed typo in `last_gt_pose` update.
+- ADDED: Live matplotlib visualization.
 """
 
 import numpy as np
@@ -26,6 +27,10 @@ from PIL import Image
 from dataclasses import dataclass 
 from scipy.ndimage import distance_transform_edt as cpu_distance_transform_edt
 import scipy
+
+# --- PLOTTING IMPORT ---
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 
 # --- Try to import GPU libraries ---
 try:
@@ -544,6 +549,43 @@ def main():
     # --- NEW: Initialize list to store errors ---
     all_position_errors = []
     
+    # --- PLOTTING: Setup the interactive plot ---
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(10, 10))
+    
+    # Get map data on CPU for plotting
+    if GPU_ENABLED:
+        map_data_cpu = map_info.occupancy_grid.get()
+    else:
+        map_data_cpu = map_info.occupancy_grid
+        
+    # Calculate map extent in meters
+    x_min = map_info.origin_x
+    y_min = map_info.origin_y
+    x_max = map_info.origin_x + (map_info.width * map_info.resolution)
+    y_max = map_info.origin_y + (map_info.height * map_info.resolution)
+    map_extent = [x_min, x_max, y_min, y_max]
+
+    # Plot the map background
+    ax.imshow(map_data_cpu, cmap='gray', origin='lower', extent=map_extent)
+    
+    # Create empty plot elements to update later
+    gt_dot, = ax.plot([], [], 'go', markersize=10, label='Ground Truth')
+    est_dot, = ax.plot([], [], 'rx', markersize=12, mew=2, label='Estimated')
+    
+    # Create the belief heatmap overlay
+    # We use a dummy array to start
+    belief_viz = ax.imshow(np.zeros_like(map_data_cpu), cmap='viridis', 
+                           origin='lower', extent=map_extent, 
+                           alpha=0.6, vmin=0.0, vmax=0.01)
+    
+    ax.set_xlabel("X (meters)")
+    ax.set_ylabel("Y (meters)")
+    ax.set_title("Markov Localization Live View")
+    ax.legend()
+    plt.show(block=False)
+    # --- END OF PLOTTING SETUP ---
+
     for i, sensor_data in enumerate(sensor_log):
         print(f"\n--- Processing Timestamp {sensor_data['timestamp']} (Step {i+1}/{total_steps}) ---")
         
@@ -620,6 +662,21 @@ def main():
         print(f"  Highest Belief: {max_prob:.4e}")
         print(f"  Belief at GT:   {prob_at_gt:.4e}")
 
+        # --- 7. PLOTTING: Update the live plot ---
+        gt_dot.set_data([gt_x_m], [gt_y_m])
+        est_dot.set_data([est_x_m], [est_y_m])
+        
+        # Update the belief heatmap
+        belief_viz.set_data(belief_grid_cpu)
+        # Re-normalize the color scale, but cap it to avoid flashes
+        belief_viz.set_clim(vmin=0, vmax=np.clip(max_prob, 0.001, 1.0))
+        
+        # Redraw the canvas
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+        plt.pause(0.01) # Small pause to allow plot to update
+        # --- END OF PLOTTING ---
+
         # Update last pose for next iteration
         # --- TYPO FIX: Corrected variable name ---
         last_gt_pose = current_gt_pose
@@ -633,6 +690,13 @@ def main():
         print(f"Processed {len(all_position_errors)} batched steps (1 every {batch_interval}).")
         print(f"Average Position Error: {average_error_m:.3f} m")
     # --- END OF NEW BLOCK ---
+
+    # --- NEW: Keep the plot open ---
+    plt.ioff() # Turn off interactive mode
+    print("\nPlot window is now static. Close the plot to exit the script.")
+    plt.show() # Keep window open
+    # --- END OF PLOTTING ---
+
 
 if __name__ == "__main__":
     main()
