@@ -13,6 +13,7 @@ It requires an NVIDIA GPU, the CUDA Toolkit, and the 'cupy' library.
 - Added final average error calculation.
 - Fixed typo in `last_gt_pose` update.
 - ADDED: Live matplotlib visualization.
+- ADDED: Gaussian belief initialization (using your 'hint').
 """
 
 import numpy as np
@@ -82,6 +83,14 @@ CONFIG = {
         'likelihood_sigma': 0.1,     # Sharpened sensor model (10cm blur)
         'likelihood_max_dist': 2.0,  # Max distance for likelihood (meters)
         'motion_diffusion_factor': 0.01, # Trust our (perfect) motion model more
+        
+        # --- NEW: POSE HINT ---
+        # Set 'use_pose_hint' to True to use this.
+        # This will start the belief as a Gaussian blob instead of uniform.
+        'use_pose_hint': True,
+        'initial_pose_hint': [-0.46, -0.55],   # <-- EDITED: Using your accurate ground truth start
+        'initial_uncertainty_m': 0.5         # Standard deviation (0.5m)
+        # --- END OF NEW HINT ---
     }
 }
 # -----------------------------------------------------------------------------
@@ -223,6 +232,16 @@ def grid_to_world(grid_x, grid_y, map_info):
     x = (grid_x + 0.5) * map_info.resolution + map_info.origin_x
     y = (grid_y + 0.5) * map_info.resolution + map_info.origin_y
     return x, y
+
+def gaussian_2d(x, y, mu_x, mu_y, sigma):
+    """
+    Calculates 2D Gaussian probability (vectorized for GPU/CPU).
+    Assumes sigma_x = sigma_y = sigma.
+    """
+    sigma_sq = sigma**2
+    top = cp.exp(-0.5 * (((x - mu_x)**2 / sigma_sq) + ((y - mu_y)**2 / sigma_sq)))
+    bottom = 2 * cp.pi * sigma_sq
+    return top / bottom
 
 def compute_likelihood_field(map_info, sigma=0.1, max_dist=2.0):
     """ precompute likelihood field for sensor model - GPU/CPU """
@@ -515,18 +534,51 @@ def main():
     )
     print(f"Likelihood field computed in {time.time() - start_time:.2f}s")
     
-    # --- 3. Initialize Belief ---
+    # --- 3. Initialize Belief (NOW WITH HINT) ---
     print("Initializing belief grid...")
-    # P(x_0) = Uniform distribution (on GPU/CPU)
-    belief_grid_gpu = cp.ones((map_info.height, map_info.width))
-    # Remove belief from occupied cells
+    
+    use_hint = config['localization'].get('use_pose_hint', False)
+    
+    if use_hint:
+        hint_x, hint_y = config['localization']['initial_pose_hint']
+        hint_std = config['localization']['initial_uncertainty_m']
+        print(f"Using initial pose hint: ({hint_x}m, {hint_y}m) with {hint_std}m uncertainty.")
+
+        # Create grid of all cell coordinates (on GPU/CPU)
+        y_coords, x_coords = cp.indices((map_info.height, map_info.width))
+        
+        # Convert all grid coords to world coords (vectorized, on CPU)
+        if GPU_ENABLED:
+            x_coords_cpu = x_coords.get()
+            y_coords_cpu = y_coords.get()
+        else:
+            x_coords_cpu = x_coords
+            y_coords_cpu = y_coords
+            
+        wx_cpu = (x_coords_cpu + 0.5) * map_info.resolution + map_info.origin_x
+        wy_cpu = (y_coords_cpu + 0.5) * map_info.resolution + map_info.origin_y
+        
+        # Move back to GPU/CPU
+        wx = cp.asarray(wx_cpu)
+        wy = cp.asarray(wy_cpu)
+
+        # Calculate 2D Gaussian
+        belief_grid_gpu = gaussian_2d(wx, wy, hint_x, hint_y, hint_std)
+
+    else:
+        print("Using uniform distribution (no pose hint).")
+        # P(x_0) = Uniform distribution (on GPU/CPU)
+        belief_grid_gpu = cp.ones((map_info.height, map_info.width))
+    
+    # This part is the same for both cases
     belief_grid_gpu[map_info.occupancy_grid > 0.5] = 0.0
     
     if cp.sum(belief_grid_gpu) == 0:
-        print("Error: Map seems to be entirely obstacles. Cannot initialize belief.")
+        print("Error: Map seems to be entirely obstacles (or hint is in a wall). Cannot initialize belief.")
         return
         
     belief_grid_gpu = belief_grid_gpu / cp.sum(belief_grid_gpu)
+    # --- END OF NEW INITIALIZE ---
     
     # --- 4. Load Sensor Data ---
     print("Loading sensor data...")
