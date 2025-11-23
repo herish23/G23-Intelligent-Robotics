@@ -1,20 +1,3 @@
-"""
-Markov Grid Based Localization (GPU)
-
-Main script to run Grid-Based (Markov) Localization, accelerated with CUDA/GPU.
-
-** This version is now FULLY SELF-CONTAINED and uses CuPy for GPU acceleration. **
-It requires an NVIDIA GPU, the CUDA Toolkit, and the 'cupy' library.
-
-**Changelog:**
-- Added 'GPU_ENABLED' flag to create a robust CPU-fallback mode.
-- Fixed 'AttributeError' crash when CuPy is not found.
-- Added 'scipy' as a standard import.
-- Added final average error calculation.
-- Added Gaussian belief initialization (using your 'hint').
-- REMOVED: All matplotlib plotting.
-"""
-
 import numpy as np
 import time
 import csv
@@ -41,7 +24,7 @@ except ImportError:
     print("Warning: Could not import 'cupy' or 'cupyx.scipy'.")
     print("GPU acceleration will be DISABLED. Script will run on CPU.")
     print("Please ensure you have an NVIDIA GPU, the CUDA Toolkit, and 'cupy' installed.")
-    print("  (e.g., 'pip install cupy-cuda12x scipy')")
+    print("   (e.g., 'pip install cupy-cuda12x scipy')")
     print("="*70)
     # Fallback to CPU-only
     cp = np # Use numpy as a substitute
@@ -71,7 +54,7 @@ CONFIG = {
         'lidar': {
             'num_rays': 360,     # Total rays in the scan
             'fov_deg': 360,      # Field of view in degrees
-            'sparsity': 10,      # Use 1-in-10 rays (36 total) for speed.
+            'sparsity': 1,       # <--- MODIFIED: Use ALL rays (360 total) for max accuracy.
         }
     },
     'localization': {
@@ -79,12 +62,9 @@ CONFIG = {
         'likelihood_max_dist': 2.0,  # Max distance for likelihood (meters)
         'motion_diffusion_factor': 0.01, # Trust our (perfect) motion model more
         
-        # --- NEW: POSE HINT ---
-        # Set 'use_pose_hint' to True to use this.
         'use_pose_hint': True,
-        'initial_pose_hint': [-0.46, -0.55],     # (x_m, y_m)
-        'initial_uncertainty_m': 0.5         # Standard deviation (0.5m)
-        # --- END OF NEW HINT ---
+        'initial_pose_hint': [-0.46, -0.55],      # (x_m, y_m)
+        'initial_uncertainty_m': 0.5          # Standard deviation (0.5m)
     }
 }
 # -----------------------------------------------------------------------------
@@ -93,13 +73,12 @@ CONFIG = {
 
 
 # -----------------------------------------------------------------------------
-# HELPER FUNCTIONS (Previously in localization_utils)
+# HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 
 @dataclass
 class MapInfo:
-    """ Container for map metadata """
-    # This stores the map on the GPU if cupy is available
+    """ Container for map metadata and the occupancy grid. """
     occupancy_grid: cp.ndarray 
     resolution: float
     origin_x: float
@@ -110,8 +89,8 @@ class MapInfo:
     free_thresh: float
 
 def load_map(pgm_path, yaml_path):
-    """ load map from pgm and yaml files """
-    # load yaml metadata
+    """ Load map from pgm and yaml files. """
+    # Load yaml metadata
     with open(yaml_path, 'r') as f:
         meta = yaml.safe_load(f)
 
@@ -120,9 +99,8 @@ def load_map(pgm_path, yaml_path):
     ox, oy = origin[0], origin[1]
     occ_thresh = meta.get('occupied_thresh', 0.65)
     free_thresh = meta.get('free_thresh', 0.25)
-    negate = meta.get('negate', 0)
 
-    # load pgm image using numpy (CPU)
+    # Load pgm image using numpy (CPU)
     try:
         img = Image.open(pgm_path)
     except FileNotFoundError:
@@ -130,20 +108,18 @@ def load_map(pgm_path, yaml_path):
         return None
     img_arr_cpu = np.array(img)
 
-    # convert to occupancy grid - trinary mode
-    # pgm: 255=white=free, 0=black=occupied
+    # Convert to occupancy grid - trinary mode
     norm = img_arr_cpu / 255.0
     occ_grid_cpu = np.where(norm > (1 - free_thresh), 0.0,
-                        np.where(norm < occ_thresh, 1.0, 0.5))
+                            np.where(norm < occ_thresh, 1.0, 0.5))
 
     h, w = occ_grid_cpu.shape
     
-    # --- GPU CHANGE ---
     # Move the final occupancy grid to the GPU (or keep as numpy if disabled)
     occ_grid_gpu = cp.asarray(occ_grid_cpu)
 
     return MapInfo(
-        occupancy_grid=occ_grid_gpu, # Store the GPU/CPU array
+        occupancy_grid=occ_grid_gpu,
         resolution=res,
         origin_x=ox,
         origin_y=oy,
@@ -154,10 +130,7 @@ def load_map(pgm_path, yaml_path):
     )
 
 def load_sensor_data(config):
-    """
-    Loads clean sensor data from the specified CSV file.
-    This function still runs on the CPU.
-    """
+    """ Loads clean sensor data from the specified CSV file. """
     csv_file_path = config['data']['sensor_data_csv_path']
     num_rays = config['sensors']['lidar']['num_rays']
     
@@ -191,8 +164,6 @@ def load_sensor_data(config):
                 try:
                     data_point = {
                         'timestamp': float(row[ts_idx]),
-                        # Keep ranges and pose as numpy arrays for now
-                        # We will move them to the GPU one by one in the loop
                         'ranges': np.array([float(r) for r in row[range_start_idx:range_end_idx]]),
                         'pose': (
                             float(row[gt_x_idx]),
@@ -215,53 +186,47 @@ def load_sensor_data(config):
     return sensor_log
 
 def world_to_grid(x, y, map_info):
-    """ world coords (meters) to grid coords (pixels) - CPU """
+    """ Converts world coords (meters) to grid coords (pixels) - CPU. """
     grid_x = int(round((x - map_info.origin_x) / map_info.resolution))
     grid_y = int(round((y - map_info.origin_y) / map_info.resolution))
     return grid_x, grid_y
 
 def grid_to_world(grid_x, grid_y, map_info):
-    """ grid coords to world coords - CPU """
-    # We add 0.5 to get the center of the cell
+    """ Converts grid coords to world coords (center of cell) - CPU. """
     x = (grid_x + 0.5) * map_info.resolution + map_info.origin_x
     y = (grid_y + 0.5) * map_info.resolution + map_info.origin_y
     return x, y
 
 def gaussian_2d(x, y, mu_x, mu_y, sigma):
-    """
-    Calculates 2D Gaussian probability (vectorized for GPU/CPU).
-    Assumes sigma_x = sigma_y = sigma.
-    """
+    """ Calculates 2D Gaussian probability (vectorized for GPU/CPU). """
     sigma_sq = sigma**2
     top = cp.exp(-0.5 * (((x - mu_x)**2 / sigma_sq) + ((y - mu_y)**2 / sigma_sq)))
     bottom = 2 * cp.pi * sigma_sq
     return top / bottom
 
 def compute_likelihood_field(map_info, sigma=0.1, max_dist=2.0):
-    """ precompute likelihood field for sensor model - GPU/CPU """
+    """ Precompute likelihood field for sensor model (Likelihood Field). """
     
-    # --- GPU CHANGE ---
-    # map_info.occupancy_grid is already on the GPU (or is numpy)
+    # Identify obstacle cells
     obs = (map_info.occupancy_grid > 0.5).astype(cp.float32)
 
-    # distance transform - euclidean dist to nearest obstacle
-    # Use the imported GPU/CPU version
+    # Euclidean Distance Transform (dist to nearest obstacle)
     dist = gpu_distance_transform_edt(1 - obs)
 
-    # convert to meters
+    # Convert to meters (for reporting, not strictly needed for final field)
     dist_m = dist * map_info.resolution
 
-    # gaussian around obstacles
+    # Calculate Gaussian falloff around obstacles
     sig_cells = sigma / map_info.resolution
     
-    # --- GPU CHANGE --- (use cp.exp)
+    # Field = P(z_measured | x_at_map_feature)
     field = cp.exp(-0.5 * (dist / sig_cells) ** 2)
 
-    # clamp far ditsances
+    # Clamp far distances (where sensor is unlikely to hit anything)
     max_cells = max_dist / map_info.resolution
     field[dist > max_cells] = 0.01
 
-    # normalize
+    # Normalize (optional, but good practice)
     field = field / field.max()
 
     return field
@@ -270,53 +235,45 @@ def compute_scan_likelihood_field(scan_ranges_gpu, scan_angles_gpu, robot_x, rob
                                   map_info, likelihood_field_gpu):
     """
     Compute total likelihood of a scan using pre-computed likelihood field.
-    Returns the *log-likelihood*.
-    This function is a mix of CPU/GPU - can be further optimized.
+    Returns the *log-likelihood* normalized by the number of valid beams.
     """
     log_likelihood = 0.0
     num_valid = 0
 
-    # --- GPU CHANGE ---
-    # Move scalar values to GPU for calculations
+    # Move scalar pose to GPU for calculations
     robot_x_gpu = cp.float32(robot_x)
     robot_y_gpu = cp.float32(robot_y)
     robot_theta_gpu = cp.float32(robot_theta)
 
-    # --- GPU CHANGE ---
-    # Perform calculations on GPU
+    # Calculate beam endpoints in world coordinates (vectorized on GPU)
     global_angles = robot_theta_gpu + scan_angles_gpu
     px_gpu = robot_x_gpu + scan_ranges_gpu * cp.cos(global_angles)
     py_gpu = robot_y_gpu + scan_ranges_gpu * cp.sin(global_angles)
 
-    # --- GPU/CPU CHANGE ---
-    # This is a bottleneck: moving data back from GPU to CPU.
-    # If GPU is disabled, this is a simple numpy array copy.
+    # Move beam endpoints and likelihood field back to CPU for iteration (bottleneck)
     if GPU_ENABLED:
         px_cpu = px_gpu.get()
         py_cpu = py_gpu.get()
-        scan_ranges_cpu = scan_ranges_gpu.get()
         likelihood_field_cpu = likelihood_field_gpu.get()
     else:
-        px_cpu = px_gpu # It's already a numpy array
+        px_cpu = px_gpu
         py_cpu = py_gpu
-        scan_ranges_cpu = scan_ranges_gpu
         likelihood_field_cpu = likelihood_field_gpu
 
-    for r, px, py in zip(scan_ranges_cpu, px_cpu, py_cpu):
-        # Skip invalid ranges
+    for r, px, py in zip(scan_ranges_gpu.get() if GPU_ENABLED else scan_ranges_gpu, px_cpu, py_cpu):
+        # Skip invalid ranges (e.g., max range hits or minimum range)
         if r < 0.12 or r > 3.5:
             continue
 
         # Convert to grid (on CPU)
-        gx, gy = world_to_grid(px, py, map_info) # Calls local function
+        gx, gy = world_to_grid(px, py, map_info)
 
-        # Check bounds
+        # Check bounds and lookup pre-computed likelihood (on CPU)
         if 0 <= gx < map_info.width and 0 <= gy < map_info.height:
-            # Lookup pre-computed likelihood (on CPU)
             p = likelihood_field_cpu[gy, gx]
-            # Avoid log(0)
+            # Avoid log(0) for numerical stability
             p = max(p, 1e-10)
-            log_likelihood += np.log(p) # Use np.log on CPU
+            log_likelihood += np.log(p)
             num_valid += 1
 
     # Normalize by number of valid beams
@@ -326,14 +283,13 @@ def compute_scan_likelihood_field(scan_ranges_gpu, scan_angles_gpu, robot_x, rob
         return 0.0 # No valid beams
 
 # -----------------------------------------------------------------------------
-# END OF HELPER FUNCTIONS
+# CORE MARKOV LOCALIZATION STEPS
 # -----------------------------------------------------------------------------
-
 
 def prediction_step(belief_grid_gpu, motion, map_info, diffusion_factor):
     """
     Updates the belief grid based on a motion model P(x_t | u_t, x_t-1).
-    'motion' is (dx_m, dy_m). Runs on GPU/CPU.
+    Uses a shift (roll) and diffusion model. Runs on GPU/CPU.
     """
     dx_m, dy_m = motion
     
@@ -341,11 +297,10 @@ def prediction_step(belief_grid_gpu, motion, map_info, diffusion_factor):
     dx_cells = int(round(dx_m / map_info.resolution))
     dy_cells = int(round(dy_m / map_info.resolution))
     
-    # --- GPU CHANGE ---
-    # This is a simple "shift" model. (use cp.roll)
+    # 1. Shift Model (Translation) - Efficiently done with cp.roll
     predicted_belief = cp.roll(belief_grid_gpu, (dy_cells, dx_cells), axis=(0, 1))
     
-    # Zero out probabilities that "leaked" from the other side
+    # Zero out probability that "rolls over" the map boundary
     if dy_cells > 0:
         predicted_belief[:dy_cells, :] = 0
     elif dy_cells < 0:
@@ -355,13 +310,13 @@ def prediction_step(belief_grid_gpu, motion, map_info, diffusion_factor):
     elif dx_cells < 0:
         predicted_belief[:, dx_cells:] = 0
 
-    # Add a simple diffusion model for motion noise
+    # 2. Diffusion Model (Uncertainty Spread)
+    # Mix with a small uniform probability to account for noise
     uniform_prob = 1.0 / belief_grid_gpu.size
     final_belief = predicted_belief * (1.0 - diffusion_factor) + \
                    (uniform_prob * diffusion_factor)
     
     # Mask out any probabilities in occupied cells
-    # map_info.occupancy_grid is already on GPU/CPU
     final_belief[map_info.occupancy_grid > 0.5] = 0.0
 
     # Normalize the belief
@@ -370,7 +325,7 @@ def prediction_step(belief_grid_gpu, motion, map_info, diffusion_factor):
         return final_belief / total_prob
     else:
         # Failsafe: re-initialize if all probability is lost
-        print("  Warning: Prediction step resulted in zero probability. Re-initializing.")
+        print("   Warning: Prediction step resulted in zero probability. Re-initializing.")
         final_belief = cp.ones_like(belief_grid_gpu)
         final_belief[map_info.occupancy_grid > 0.5] = 0.0
         return final_belief / cp.sum(final_belief)
@@ -383,45 +338,38 @@ def correction_step(belief_grid_gpu, sensor_data, map_info, likelihood_field_gpu
     
     lidar_config = config['sensors']['lidar']
     
-    # --- GPU CHANGE ---
-    # Move sensor data to GPU (or keep as numpy if disabled)
+    # Move sensor data to GPU 
     lidar_ranges_gpu = cp.asarray(sensor_data['ranges'])
     
-    # Create an array of lidar angles (on GPU/CPU)
+    # Create an array of lidar angles
     angles_gpu = cp.linspace(
         -math.radians(lidar_config['fov_deg']) / 2.0,
         math.radians(lidar_config['fov_deg']) / 2.0,
         lidar_config['num_rays']
     )
     
-    # Apply sparsity
+    # Apply sparsity (now 1)
     sparse_indices = cp.arange(0, len(lidar_ranges_gpu), lidar_config['sparsity'])
     sparse_ranges_gpu = lidar_ranges_gpu[sparse_indices]
     sparse_angles_gpu = angles_gpu[sparse_indices]
 
-    # ** This is the 2D "cheat" **
+    # Use Ground Truth orientation (Simplified 2D approach)
     gt_theta_rad = sensor_data['pose'][2]
 
-    # Create a likelihood grid (log-probabilities)
-    log_likelihood_grid = cp.zeros_like(belief_grid_gpu)
-    
     if verbose:
-        print("  Running correction step (using likelihood field)...")
+        print("   Running correction step (using likelihood field)...")
     
-    # Create grid of all possible cell coordinates (on GPU/CPU)
+    # Create world coordinates for ALL cells (used to hypothesize position)
     y_coords, x_coords = cp.indices(belief_grid_gpu.shape)
     
-    # --- GPU/CPU BUG FIX ---
-    # Convert all grid coords to world coords (on CPU)
-    # This is a bottleneck!
+    # Convert all grid coords to world coords (This is currently on CPU/Numpy)
     if GPU_ENABLED:
         x_coords_cpu = x_coords.get()
         y_coords_cpu = y_coords.get()
     else:
-        x_coords_cpu = x_coords # It's already a numpy array
+        x_coords_cpu = x_coords
         y_coords_cpu = y_coords
         
-    # We must use the numpy-based grid_to_world for this array operation
     wx_cpu = (x_coords_cpu + 0.5) * map_info.resolution + map_info.origin_x
     wy_cpu = (y_coords_cpu + 0.5) * map_info.resolution + map_info.origin_y
     
@@ -429,10 +377,10 @@ def correction_step(belief_grid_gpu, sensor_data, map_info, likelihood_field_gpu
     wx = cp.asarray(wx_cpu)
     wy = cp.asarray(wy_cpu)
     
-    # Initialize log-likelihoods
-    log_likelihood_grid = cp.full_like(belief_grid_gpu, -cp.inf) # Start all at -inf
+    # Initialize log-likelihoods grid
+    log_likelihood_grid = cp.full_like(belief_grid_gpu, -cp.inf) 
     
-    # Find all valid cells (not in an obstacle AND have some belief)
+    # Find all valid cells (free space AND have non-zero belief)
     valid_mask = (map_info.occupancy_grid < 0.5) & (belief_grid_gpu > 1e-9)
     
     valid_y = y_coords[valid_mask]
@@ -440,11 +388,9 @@ def correction_step(belief_grid_gpu, sensor_data, map_info, likelihood_field_gpu
     valid_wx = wx[valid_mask]
     valid_wy = wy[valid_mask]
 
-    # Calculate log-likelihood for all valid cells
-    # This loop is the main bottleneck.
+    # Calculate log-likelihood for all valid cells (main bottleneck loop)
     log_p_values = []
     
-    # --- GPU/CPU BUG FIX ---
     if GPU_ENABLED:
         valid_wx_cpu = valid_wx.get()
         valid_wy_cpu = valid_wy.get()
@@ -452,7 +398,7 @@ def correction_step(belief_grid_gpu, sensor_data, map_info, likelihood_field_gpu
         valid_wx_cpu = valid_wx
         valid_wy_cpu = valid_wy
         
-    for wx_cell, wy_cell in zip(valid_wx_cpu, valid_wy_cpu): # .get() to iterate on CPU
+    for wx_cell, wy_cell in zip(valid_wx_cpu, valid_wy_cpu):
         log_p = compute_scan_likelihood_field(
             sparse_ranges_gpu, sparse_angles_gpu, 
             wx_cell, wy_cell, gt_theta_rad,
@@ -465,22 +411,23 @@ def correction_step(belief_grid_gpu, sensor_data, map_info, likelihood_field_gpu
         log_likelihood_grid[valid_y, valid_x] = cp.asarray(log_p_values)
     
     if verbose:
-        print(f"  Correction step done. (Computed likelihood for {len(valid_y)} cells)")
+        print(f"   Correction step done. (Computed likelihood for {len(valid_y)} cells)")
 
-    # Convert from log-probability to probability
+    # Convert from log-probability to probability (P(z|x))
     if len(valid_y) > 0:
         max_log_like = cp.max(log_likelihood_grid[cp.isfinite(log_likelihood_grid)])
     else:
-        max_log_like = 0.0 # No valid cells, nothing to compute
+        max_log_like = 0.0
     
     if not cp.isfinite(max_log_like):
         if verbose:
-            print("  Warning: All cells have -inf log-likelihood. Belief may collapse.")
+            print("   Warning: All cells have -inf log-likelihood. Belief may collapse.")
         max_log_like = 0.0
 
+    # Scale to prevent numerical underflow (uses the max log trick)
     likelihood_grid = cp.exp(log_likelihood_grid - max_log_like)
     
-    # Update belief: Bel(x_t) = eta * P(z_t | x_t) * Bel_bar(x_t)
+    # 3. Bayes Update: Bel(x_t) = eta * P(z_t | x_t) * Bel_bar(x_t)
     updated_belief = belief_grid_gpu * likelihood_grid
     
     # Normalize the final belief
@@ -490,7 +437,7 @@ def correction_step(belief_grid_gpu, sensor_data, map_info, likelihood_field_gpu
     else:
         # Failsafe
         if verbose:
-            print("  Warning: Belief collapsed. Re-initializing.")
+            print("   Warning: Belief collapsed. Re-initializing.")
         final_belief = cp.ones_like(belief_grid_gpu)
         final_belief[map_info.occupancy_grid > 0.5] = 0.0
         return final_belief / cp.sum(final_belief)
@@ -507,7 +454,7 @@ def main():
             config['data']['map_pgm_path'], 
             config['data']['map_yaml_path']
         )
-        if map_info is None: # Check if load_map failed
+        if map_info is None:
             return
         print(f"Map loaded: {map_info.width}x{map_info.height} cells @ {map_info.resolution:.3f} m/cell")
     except FileNotFoundError as e:
@@ -541,7 +488,7 @@ def main():
         # Create grid of all cell coordinates (on GPU/CPU)
         y_coords, x_coords = cp.indices((map_info.height, map_info.width))
         
-        # Convert all grid coords to world coords (vectorized, on CPU)
+        # Convert all grid coords to world coords 
         if GPU_ENABLED:
             x_coords_cpu = x_coords.get()
             y_coords_cpu = y_coords.get()
@@ -564,7 +511,7 @@ def main():
         # P(x_0) = Uniform distribution (on GPU/CPU)
         belief_grid_gpu = cp.ones((map_info.height, map_info.width))
     
-    # This part is the same for both cases
+    # Mask out obstacles and normalize
     belief_grid_gpu[map_info.occupancy_grid > 0.5] = 0.0
     
     if cp.sum(belief_grid_gpu) == 0:
@@ -572,7 +519,6 @@ def main():
         return
         
     belief_grid_gpu = belief_grid_gpu / cp.sum(belief_grid_gpu)
-    # --- END OF NEW INITIALIZE ---
     
     # --- 4. Load Sensor Data ---
     print("Loading sensor data...")
@@ -583,7 +529,8 @@ def main():
     print(f"Loaded {len(sensor_log)} full data points.")
     
     # --- EDITED: BATCH THE DATA ---
-    batch_interval = 50
+    # MODIFICATION: Changed batch_interval from 50 to 32
+    batch_interval = 32 
     sensor_log = sensor_log[::batch_interval]
     print(f"Batched data to {len(sensor_log)} steps (1 every {batch_interval}).")
     # --- END OF EDIT ---
@@ -592,7 +539,7 @@ def main():
     last_gt_pose = None
     total_steps = len(sensor_log)
     
-    # --- NEW: Initialize list to store errors ---
+    # Initialize list to store errors
     all_position_errors = []
 
     for i, sensor_data in enumerate(sensor_log):
@@ -611,7 +558,7 @@ def main():
             dy_m = current_gt_pose[1] - last_gt_pose[1]
             motion = (dx_m, dy_m)
             
-            print(f"  Applying motion: dx={dx_m:.2f}m, dy={dy_m:.2f}m")
+            print(f"   Applying motion: dx={dx_m:.2f}m, dy={dy_m:.2f}m")
                 
             belief_grid_gpu = prediction_step(
                 belief_grid_gpu, 
@@ -620,7 +567,7 @@ def main():
                 config['localization']['motion_diffusion_factor']
             )
         else:
-            print("  Skipping prediction step (first frame).")
+            print("   Skipping prediction step (first frame).")
 
         # --- Correction Step (Sensor Model) ---
         belief_grid_gpu = correction_step(
@@ -629,17 +576,17 @@ def main():
             map_info, 
             likelihood_field_gpu, 
             config,
-            verbose=True # Always print correction step details
+            verbose=True
         )
 
         # --- Find Best Estimate & Print ---
-        # --- GPU/CPU BUG FIX ---
-        # Move data back to CPU for argmax and printing (if it was on GPU)
+        # Move data back to CPU for argmax and printing
         if GPU_ENABLED:
             belief_grid_cpu = belief_grid_gpu.get()
         else:
-            belief_grid_cpu = belief_grid_gpu # It's already a numpy array
+            belief_grid_cpu = belief_grid_gpu
         
+        # Find the max probability cell
         est_grid_y, est_grid_x = np.unravel_index(
             np.argmax(belief_grid_cpu), 
             belief_grid_cpu.shape
@@ -647,43 +594,40 @@ def main():
         est_x_m, est_y_m = grid_to_world(est_grid_x, est_grid_y, map_info)
         max_prob = np.max(belief_grid_cpu)
         
+        # Get probability at ground truth location
         prob_at_gt = 0.0
         if 0 <= gt_grid_x < map_info.width and 0 <= gt_grid_y < map_info.height:
-             # --- TYPO FIX: Changed prob_at_gty to prob_at_gt ---
-             prob_at_gt = belief_grid_cpu[gt_grid_y, gt_grid_x]
+            prob_at_gt = belief_grid_cpu[gt_grid_y, gt_grid_x]
         else:
-            print(f"  Warning: Ground truth ({gt_grid_x}, {gt_grid_y}) is outside map bounds (0-{map_info.width}, 0-{map_info.height}).")
+            print(f"   Warning: Ground truth ({gt_grid_x}, {gt_grid_y}) is outside map bounds (0-{map_info.width}, 0-{map_info.height}).")
 
         # --- 6. Print and Compare ---
-        print("\n  --- Results ---")
-        print(f"  Step Time: {time.time() - start_step_time:.2f}s")
-        print(f"  Ground Truth (World): ({gt_x_m:.2f}m, {gt_y_m:.2f}m)")
-        print(f"  Ground Truth (Grid):  ({gt_grid_x}, {gt_grid_y})")
-        print(f"  Estimated Pos (World): ({est_x_m:.2f}m, {est_y_m:.2f}m)")
-        print(f"  Estimated Pos (Grid):  ({est_grid_x}, {est_grid_y})")
+        print("\n   --- Results ---")
+        print(f"   Step Time: {time.time() - start_step_time:.2f}s")
+        print(f"   Ground Truth (World): ({gt_x_m:.2f}m, {gt_y_m:.2f}m)")
+        print(f"   Ground Truth (Grid):  ({gt_grid_x}, {gt_grid_y})")
+        print(f"   Estimated Pos (World): ({est_x_m:.2f}m, {est_y_m:.2f}m)")
+        print(f"   Estimated Pos (Grid):  ({est_grid_x}, {est_grid_y})")
         
-        # --- NEW: Calculate and store error ---
+        # Calculate and store error
         current_error_m = math.dist((gt_x_m, gt_y_m), (est_x_m, est_y_m))
         all_position_errors.append(current_error_m)
-        print(f"  Position Error: {current_error_m:.3f} m")
-        # --- END OF NEW BLOCK ---
+        print(f"   Position Error: {current_error_m:.3f} m")
         
-        print(f"  Highest Belief: {max_prob:.4e}")
-        print(f"  Belief at GT:   {prob_at_gt:.4e}")
+        print(f"   Highest Belief: {max_prob:.4e}")
+        print(f"   Belief at GT:   {prob_at_gt:.4e}")
 
         # Update last pose for next iteration
-        # --- TYPO FIX: Corrected variable name ---
         last_gt_pose = current_gt_pose
     
     print("\n--- Localization Complete ---")
 
-    # --- NEW: Calculate and print average error ---
-    if all_position_errors: # Avoid division by zero
+    # --- Final Summary ---
+    if all_position_errors:
         average_error_m = sum(all_position_errors) / len(all_position_errors)
         print("\n--- Final Summary ---")
         print(f"Processed {len(all_position_errors)} batched steps (1 every {batch_interval}).")
         print(f"Average Position Error: {average_error_m:.3f} m")
-    # --- END OF NEW BLOCK ---
 
 if __name__ == "__main__":
     main()
